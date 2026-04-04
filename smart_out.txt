@@ -1,0 +1,98 @@
+
+=== SIGNALFIX AI MODULE 1 (REV 2.8.4 0.1% TIER CERTIFICATION) ===
+
+=== [REV 2.8.4 0.1% TIER BOOT AUDIT: ROC CONFIG] ===
+  fallback_limit (ANCHOR):       5000.0000
+  PHYSICAL_MAX_ROC:              10000000.0
+  k_sigma_high:                  3.500
+  alpha (learning rate):         0.050
+  beta_up (rise rate):           0.005
+  beta_down (fall rate):         0.050
+  beta_baseline (anchor):        0.0010
+  sigma_governor_ratios:         0.50 / 3.00
+  warm_up_samples:               30
+==============================================
+
+ STREAM: FORENSIC_SPIKE_TEST (Rev 2.8.4 0.1% Tier Certified)
+ ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  [  0] rr=      0 | ??=      0 ??=    0.0 streak=0  | T=    nan Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  0]  [NOMINAL][INFO    ][NORMAL    ]      
+          Sensor operating within all configured bounds.
+          dur=0   | conf=LOW (0.00)
+  [  1] rr=   9161 | ??=   7500 ??=    0.0 streak=0  | T=    nan Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  2] rr=   3980 | ??=   7324 ??=  767.1 streak=1  | T= 4750.0 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  3] rr=   3960 | ??=   7156 ??= 1047.2 streak=2  | T= 4646.7 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  4] rr=    473 | ??=   6822 ??= 1778.6 streak=3  | T= 4597.7 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  5] rr=   8376 | ??=   6856 ??= 1739.8 streak=4  | T= 4605.8 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  6] rr=    218 | ??=   6524 ??= 2228.9 streak=5  | T= 4613.2 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  7] rr=    635 | ??=   6229 ??= 2523.3 streak=6  | T= 4629.2 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  8] rr=   7925 | ??=   6293 ??= 2474.9 streak=7  | T= 4650.2 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [  9] rr=   1715 | ??=   6064 ??= 2610.5 streak=8  | T= 4670.2 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 10] rr=   1335 | ??=   5827 ??= 2745.2 streak=9  | T= 4692.6 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 11] rr=   8040 | ??=   5911 ??= 2700.4 streak=10 | T= 4717.1 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 12] rr=   1751 | ??=   5703 ??= 2783.8 streak=11 | T= 4740.8 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 13] rr=   4320 | ??=   5634 ??= 2730.0 streak=12 | T= 4765.8 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 14] rr=   3462 | ??=   5525 ??= 2702.7 streak=13 | T= 4789.8 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 15] rr=   5094 | ??=   5504 ??= 2635.9 streak=14 | T= 4813.1 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 16] rr=   1121 | ??=   5285 ??= 2741.0 streak=15 | T= 4835.2 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 17] rr=   2612 | ??=   5151 ??= 2734.3 streak=16 | T= 4859.0 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 18] rr=   6413 | ??=   5214 ??= 2679.2 streak=17 | T= 4882.5 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 19] rr=   7436 | ??=   5325 ??= 2655.9 streak=0  | T= 4905.0 Status=ROC_EXCEEDED Hint=DRIFT(0.52) dur=1  | Class=ACTIVE_FAULT  
+  [ 19]  [DRIFT  ][LOW     ][TRANSIENT ] [.]  
+          Minor deviation detected. Monitor for persistence.
+          dur=1   | conf=MED (0.52)
+          Cause:  Slow deviation may indicate calibration bias, thermal expansion, or sensor aging.
+          Action: MONITOR
+  [ 20] rr=   9473 | ??=   5434 ??= 2631.7 streak=0  | T= 4927.0 Status=ROC_EXCEEDED Hint=DRIFT(0.54) dur=2  | Class=ACTIVE_FAULT  
+  [ 21] rr=   6661 | ??=   5495 ??= 2579.0 streak=0  | T= 4948.4 Status=ROC_EXCEEDED Hint=DRIFT(0.48) dur=3  | Class=ACTIVE_FAULT  
+  [ 22] rr=   3606 | ??=   5401 ??= 2547.2 streak=1  | T= 4968.8 Status=NOMINAL      Hint=DRIFT(0.46) dur=4  | Class=NOMINAL      
+  [ 23] rr=   2716 | ??=   5267 ??= 2550.7 streak=2  | T= 4988.5 Status=NOMINAL      Hint=DRIFT(0.44) dur=5  | Class=NOMINAL      
+  [ 24] rr=   3273 | ??=   5167 ??= 2523.8 streak=3  | T= 5008.2 Status=NOMINAL      Hint=DRIFT(0.41) dur=6  | Class=NOMINAL      
+  [ 24]  [DRIFT  ][MEDIUM  ][TRANSIENT ] [!]  
+          Sustained deviation from baseline. Review sensor calibration.
+          dur=6   | conf=MED (0.41)
+          Cause:  Slow deviation may indicate calibration bias, thermal expansion, or sensor aging.
+          Action: INVESTIGATE
+  [ 25] rr=    193 | ??=   4918 ??= 2688.2 streak=4  | T= 5027.3 Status=NOMINAL      Hint=DRIFT(0.39) dur=7  | Class=NOMINAL      
+  [ 26] rr=   7423 | ??=   5043 ??= 2676.4 streak=5  | T= 5049.2 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 26]  [NOMINAL] Signal restored. Stream operating normally.
+  [ 27] rr=   6648 | ??=   5124 ??= 2631.9 streak=0  | T= 5070.8 Status=ROC_EXCEEDED Hint=DRIFT(0.31) dur=1  | Class=ACTIVE_FAULT  
+  [ 27]  [DRIFT  ][LOW     ][TRANSIENT ] [.]  
+          Minor deviation detected. Monitor for persistence.
+          dur=1   | conf=LOW (0.31)
+          Cause:  Slow deviation may indicate calibration bias, thermal expansion, or sensor aging.
+          Action: MONITOR
+  [ 28] rr=   1857 | ??=   4960 ??= 2662.3 streak=1  | T= 5091.5 Status=NOMINAL      Hint=DRIFT(0.30) dur=2  | Class=NOMINAL      
+  [ 29] rr=   4402 | ??=   4932 ??= 2597.7 streak=2  | T= 5112.7 Status=NOMINAL      Hint=DRIFT(0.28) dur=3  | Class=NOMINAL      
+  [ 30] rr=   2318 | ??=   4802 ??= 2595.3 streak=3  | T= 5132.6 Status=NOMINAL      Hint=DRIFT(0.27) dur=4  | Class=NOMINAL      
+  [ 31] rr=   3155 | ??=   4719 ??= 2554.9 streak=4  | T= 5152.3 Status=NOMINAL      Hint=DRIFT(0.25) dur=5  | Class=NOMINAL      
+  [ 32] rr=   4854 | ??=   4726 ??= 2490.4 streak=5  | T= 5171.3 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 32]  [NOMINAL] Signal restored. Stream operating normally.
+  [ 33] rr=   2410 | ??=   4610 ??= 2479.2 streak=6  | T= 5189.0 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 34] rr=   5883 | ??=   4674 ??= 2432.3 streak=7  | T= 5206.4 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 35] rr=1449460 | ??=   4815 ??= 2449.4 streak=0  | T= 5223.0 Status=ROC_EXCEEDED Hint=SPIKE(1.00) dur=1  | Class=ACTIVE_FAULT  
+  [ 35]  [SPIKE  ][HIGH    ][TRANSIENT ] [!!] 
+          Strong non-physical impulse. Check for impact event or sensor fault.
+          dur=1   | conf=HIGH(1.00)
+          Cause:  Sudden multi-sample ROC violation may indicate mechanical impact, sensor damage, or bus noise burst.
+          Action: URGENT_CHECK
+  [ 36] rr=1454556 | ??=   4949 ??= 2458.1 streak=0  | T= 5239.7 Status=ROC_EXCEEDED Hint=SPIKE(1.00) dur=2  | Class=ACTIVE_FAULT  
+  [ 37] rr=   4546 | ??=   4929 ??= 2397.4 streak=1  | T= 5256.5 Status=NOMINAL      Hint=SPIKE(0.95) dur=3  | Class=NOMINAL      
+  [ 38] rr=    397 | ??=   4703 ??= 2536.9 streak=2  | T= 5272.2 Status=NOMINAL      Hint=SPIKE(0.90) dur=4  | Class=NOMINAL      
+  [ 39] rr=   4031 | ??=   4669 ??= 2477.0 streak=3  | T= 5290.2 Status=NOMINAL      Hint=SPIKE(0.86) dur=5  | Class=NOMINAL      
+  [ 40] rr=   3462 | ??=   4609 ??= 2428.6 streak=4  | T= 5307.1 Status=NOMINAL      Hint=SPIKE(0.81) dur=6  | Class=NOMINAL      
+  [ 41] rr=    715 | ??=   4414 ??= 2514.6 streak=5  | T= 5323.1 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 41]  [NOMINAL] Signal restored. Stream operating normally.
+  [ 42] rr=   4937 | ??=   4440 ??= 2453.6 streak=6  | T= 5340.5 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 43] rr=   1665 | ??=   4301 ??= 2466.7 streak=7  | T= 5356.7 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 44] rr=    205 | ??=   4097 ??= 2564.7 streak=8  | T= 5373.1 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 45] rr=   3947 | ??=   4089 ??= 2500.0 streak=9  | T= 5391.1 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 46] rr=    548 | ??=   3912 ??= 2556.0 streak=10 | T= 5407.9 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 47] rr=   8392 | ??=   4091 ??= 2611.1 streak=11 | T= 5425.6 Status=NOMINAL      Hint=NONE (0.00) dur=0  | Class=NOMINAL      
+  [ 48] rr=   5524 | ??=   4163 ??= 2564.1 streak=0  | T= 5444.2 Status=ROC_EXCEEDED Hint=DRIFT(0.30) dur=1  | Class=ACTIVE_FAULT  
+  [ 48]  [DRIFT  ][LOW     ][TRANSIENT ] [.]  
+          Minor deviation detected. Monitor for persistence.
+          dur=1   | conf=LOW (0.30)
+          Cause:  Slow deviation may indicate calibration bias, thermal expansion, or sensor aging.
+          Action: MONITOR
+  [ 49] rr=   2122 | ??=   4061 ??= 2538.4 streak=1  | T= 5461.8 Status=NOMINAL      Hint=DRIFT(0.28) dur=2  | Class=NOMINAL      
