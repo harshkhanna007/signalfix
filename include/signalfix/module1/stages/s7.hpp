@@ -214,6 +214,23 @@
 namespace signalfix {
 
 // ---------------------------------------------------------------------------
+// Hard Gate Layer Definitions
+// ---------------------------------------------------------------------------
+enum class HardGateFailReason : uint8_t {
+    NONE = 0,
+    INVALID_DATA,
+    TIMING_ANOMALY,
+    UNSTABLE_CONTEXT,
+    INSUFFICIENT_HISTORY,
+    NUMERICAL_FAILURE
+};
+
+struct HardGateResult {
+    bool pass;
+    HardGateFailReason reason;
+};
+
+// ---------------------------------------------------------------------------
 // StageS7Output — Output Packaging & Integrity Layer (Rev 1.3)
 // ---------------------------------------------------------------------------
 class StageS7Output final : public IStage
@@ -325,6 +342,15 @@ private:
         bool                      is_stale,
         uint64_t                  nominal_delta_t_us,
         const PerChannelTsRecord* ts_record) noexcept;
+
+    [[nodiscard]] HardGateResult hard_gate_pass(
+        const MeasurementEnvelope& envelope,
+        const ChannelState&        channel_state) const noexcept;
+
+    static void suppress_drift(
+        MeasurementEnvelope& envelope,
+        ChannelState&        channel_state,
+        HardGateFailReason   reason) noexcept;
 
     [[nodiscard]] static SampleQuality classify_quality(
         SampleStatus status,

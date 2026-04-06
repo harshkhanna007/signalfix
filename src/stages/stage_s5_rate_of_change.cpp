@@ -34,6 +34,15 @@ StageResult StageS5RateOfChange::process(
     envelope.roc_adaptive_limit = std::numeric_limits<float>::quiet_NaN();
     envelope.roc_threshold_used = std::numeric_limits<float>::quiet_NaN();
 
+    // Initialize envelope fault state to "no fault" (will be updated below)
+    envelope.fault_state.is_active_fault = false;
+    envelope.fault_state.is_recovering = false;
+    envelope.fault_state.samples_since_fault_onset = 0u;
+    envelope.fault_state.confidence_at_onset = 0.0f;
+    envelope.fault_state.confidence_current = 0.0f;
+    envelope.fault_state.recovery_confirmed = false;
+    envelope.fault_state.samples_in_recovery = 0u;
+
     const double dt_s = static_cast<double>(envelope.delta_t_us) / 1'000'000.0;
     
     // --- STEP 0: Continuity Guardians ---
@@ -133,6 +142,20 @@ StageResult StageS5RateOfChange::process(
     const double beta = (t_target > t_old) ? config_.beta_up : config_.beta_down;
     channel_state.roc_threshold_ema = static_cast<float>((1.0 - beta) * t_old + beta * t_target);
     
+    // [STABILITY FLOOR]: Prevent indefinite threshold decay and false-positive drift
+    double fallback_safe = static_cast<double>(config_.fallback_limit);
+    if (!std::isfinite(fallback_safe) || fallback_safe <= 0.001) {
+        fallback_safe = 0.001; // Defensive guard against invalid config
+    }
+    const float min_threshold = static_cast<float>(fallback_safe * 0.8);
+    const float max_threshold = static_cast<float>(fallback_safe * 3.0);
+    
+    // Recovery from NaNs introduced by corrupted math before clamping
+    if (!std::isfinite(channel_state.roc_threshold_ema)) {
+        channel_state.roc_threshold_ema = max_threshold; 
+    }
+    channel_state.roc_threshold_ema = std::clamp(channel_state.roc_threshold_ema, min_threshold, max_threshold);
+
     // INVARIANT: Final limit must be non-zero to protect math below.
     const float final_limit = std::max(channel_state.roc_threshold_ema, 0.001f);
     envelope.roc_adaptive_limit = final_limit;
@@ -162,6 +185,101 @@ StageResult StageS5RateOfChange::process(
     } else {
         envelope.status = clear_flag(envelope.status, SampleStatus::ROC_EXCEEDED);
         channel_state.roc_violation_count = 0u;
+    }
+
+    // =========================================================================
+    // STEP 5.5: [FAULT STATE TRACKER] — Distinguish Active vs. Recovering
+    // =========================================================================
+
+    const bool is_active_now = has_flag(envelope.status, SampleStatus::ROC_EXCEEDED);
+    const bool is_nominal_now = (envelope.status == SampleStatus::NOMINAL);
+    const float current_conf = envelope.failure_confidence;
+
+    // Case 1: NEW FAULT ONSET (transition from healthy to ROC_EXCEEDED)
+    if (is_active_now && !channel_state.fault_tracker.has_active_fault) {
+        // First sample of new fault
+        channel_state.fault_tracker.has_active_fault = true;
+        channel_state.fault_tracker.fault_onset_sequence_id = envelope.sequence_id;
+        channel_state.fault_tracker.fault_onset_confidence = current_conf;
+        channel_state.fault_tracker.last_sample_with_fault = envelope.sequence_id;
+        channel_state.fault_tracker.recovery_fully_confirmed = false;
+        channel_state.fault_tracker.recovery_grace_period = 0u;
+        
+        // Set envelope state
+        envelope.fault_state.is_active_fault = true;
+        envelope.fault_state.is_recovering = false;
+        envelope.fault_state.fault_onset_sequence_id = envelope.sequence_id;
+        envelope.fault_state.confidence_at_onset = current_conf;
+        envelope.fault_state.confidence_current = current_conf;
+        envelope.fault_state.samples_since_fault_onset = 1u;
+        envelope.fault_state.recovery_confirmed = false;
+    }
+    // Case 2: CONTINUING ACTIVE FAULT (still in ROC_EXCEEDED phase)
+    else if (is_active_now && channel_state.fault_tracker.has_active_fault) {
+        const uint64_t delta_seq = 
+            (envelope.sequence_id >= channel_state.fault_tracker.fault_onset_sequence_id)
+            ? (envelope.sequence_id - channel_state.fault_tracker.fault_onset_sequence_id)
+            : UINT32_MAX;  // saturate on wrap
+        
+        envelope.fault_state.is_active_fault = true;
+        envelope.fault_state.is_recovering = false;
+        envelope.fault_state.fault_onset_sequence_id = channel_state.fault_tracker.fault_onset_sequence_id;
+        envelope.fault_state.confidence_at_onset = channel_state.fault_tracker.fault_onset_confidence;
+        envelope.fault_state.confidence_current = current_conf;
+        envelope.fault_state.samples_since_fault_onset = 
+            std::min(static_cast<uint32_t>(delta_seq), static_cast<uint32_t>(UINT32_MAX));
+        
+        channel_state.fault_tracker.last_sample_with_fault = envelope.sequence_id;
+    }
+    // Case 3: RECOVERY PHASE (NOMINAL status but confidence > 0, within decay window)
+    else if (is_nominal_now && channel_state.fault_tracker.has_active_fault && current_conf > 0.0f) {
+        const uint64_t delta_seq = 
+            (envelope.sequence_id >= channel_state.fault_tracker.fault_onset_sequence_id)
+            ? (envelope.sequence_id - channel_state.fault_tracker.fault_onset_sequence_id)
+            : UINT32_MAX;
+        
+        envelope.fault_state.is_active_fault = false;
+        envelope.fault_state.is_recovering = true;
+        envelope.fault_state.fault_onset_sequence_id = channel_state.fault_tracker.fault_onset_sequence_id;
+        envelope.fault_state.confidence_at_onset = channel_state.fault_tracker.fault_onset_confidence;
+        envelope.fault_state.confidence_current = current_conf;
+        envelope.fault_state.samples_since_fault_onset = 
+            std::min(static_cast<uint32_t>(delta_seq), static_cast<uint32_t>(UINT32_MAX));
+        envelope.fault_state.recovery_confirmed = false;
+        envelope.fault_state.samples_in_recovery = 0u;
+    }
+    // Case 4: RECOVERY COMPLETE (NOMINAL status AND confidence == 0.0)
+    else if (is_nominal_now && channel_state.fault_tracker.has_active_fault && current_conf == 0.0f) {
+        // Multi-sample grace period to confirm recovery (avoid noise-induced re-detection)
+        channel_state.fault_tracker.recovery_grace_period++;
+        
+        if (channel_state.fault_tracker.recovery_grace_period >= 2u) {
+            // Recovery confirmed
+            channel_state.fault_tracker.has_active_fault = false;
+            channel_state.fault_tracker.recovery_fully_confirmed = true;
+        }
+        
+        envelope.fault_state.is_active_fault = false;
+        envelope.fault_state.is_recovering = false;
+        envelope.fault_state.fault_onset_sequence_id = 0u;
+        envelope.fault_state.confidence_at_onset = 0.0f;
+        envelope.fault_state.confidence_current = 0.0f;
+        envelope.fault_state.samples_since_fault_onset = 0u;
+        envelope.fault_state.recovery_confirmed = (channel_state.fault_tracker.recovery_grace_period >= 2u);
+        envelope.fault_state.samples_in_recovery = channel_state.fault_tracker.recovery_grace_period;
+    }
+    // Case 5: CLEAN STATE (no fault, never had a fault)
+    else if (is_nominal_now && !channel_state.fault_tracker.has_active_fault) {
+        // Clean: no fault active, no recovery pending
+        envelope.fault_state.is_active_fault = false;
+        envelope.fault_state.is_recovering = false;
+        envelope.fault_state.recovery_confirmed = false;
+        envelope.fault_state.samples_since_fault_onset = 0u;
+        envelope.fault_state.confidence_at_onset = 0.0f;
+        envelope.fault_state.confidence_current = 0.0f;
+        
+        // Reset grace period
+        channel_state.fault_tracker.recovery_grace_period = 0u;
     }
 
     // =========================================================================
@@ -197,10 +315,10 @@ StageResult StageS5RateOfChange::process(
     // // STEP 7: [ROOT CORRECTION] — Gated Baseline Learning
     // =========================================================================
     const bool is_pure = (envelope.status == SampleStatus::NOMINAL);
-    const bool is_stable = (channel_state.roc_normal_streak >= 5u);
     const bool is_post_warmup = (channel_state.roc_n > config_.warm_up_samples);
 
-    if (is_pure && is_stable && is_post_warmup) {
+    if (is_pure && (channel_state.roc_normal_streak >= 30u) && is_post_warmup) {
+        // Only update baseline after 30 consecutive normal samples to prevent learning from transient noise
         const double beta_b = config_.beta_baseline;
         const double b_old  = static_cast<double>(channel_state.roc_sigma_baseline);
         channel_state.roc_sigma_baseline = static_cast<float>((1.0 - beta_b) * b_old + beta_b * sigma);

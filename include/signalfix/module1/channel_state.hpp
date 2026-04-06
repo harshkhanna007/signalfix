@@ -102,6 +102,21 @@ struct FailurePersistenceState
 };
 static_assert(sizeof(FailurePersistenceState) == 32u, "FailurePersistenceState size mismatch (Rev 2.7).");
 
+
+// ---------------------------------------------------------------------------
+// FaultStateTracker — S5 tracking logic (Rev 2.8.5)
+// ---------------------------------------------------------------------------
+struct FaultStateTracker {
+    bool has_active_fault;                      // flag: was there a fault detected in prior sample?
+    bool recovery_fully_confirmed;              // true after 1 sample of NOMINAL status post-fault
+    uint8_t _pad[2];                            // alignment padding
+    uint32_t fault_onset_sequence_id;           // seq_id when ROC_EXCEEDED first set
+    float fault_onset_confidence;               // confidence when fault first detected
+    uint32_t last_sample_with_fault;            // seq_id of last sample with failure_hint != NONE
+    uint32_t recovery_grace_period;             // counter for multi-sample recovery confirmation (min 1)
+};
+
+
 // ---------------------------------------------------------------------------
 // GapDetectionState — Gap pre-detection and policy bookkeeping (S2a, S4)
 //
@@ -221,6 +236,10 @@ struct ChannelState
     // ── Failure Persistence (S7) ─────────────────────────────────────────────
 
     FailurePersistenceState failure_state; ///< Persistent failure tracking.
+    
+    // ── Fault State Tracker (S5) ─────────────────────────────────────────────
+    
+    FaultStateTracker fault_tracker;       ///< Advanced fault timing and recovery.
 };
 
 
@@ -308,6 +327,14 @@ inline void init_channel_state(ChannelState& cs,
     cs.failure_state.enter_counter       = 0u;
     cs.failure_state.exit_counter        = 0u;
     cs.failure_state.last_failure_ts_us  = 0u;
+
+    // Fault Tracker Initialization
+    cs.fault_tracker.has_active_fault = false;
+    cs.fault_tracker.fault_onset_sequence_id = 0u;
+    cs.fault_tracker.fault_onset_confidence = 0.0f;
+    cs.fault_tracker.last_sample_with_fault = 0u;
+    cs.fault_tracker.recovery_fully_confirmed = false;
+    cs.fault_tracker.recovery_grace_period = 0u;
 }
 
 } // namespace signalfix

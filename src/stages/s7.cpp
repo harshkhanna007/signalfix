@@ -308,6 +308,16 @@ StageResult StageS7Output::process(
 
     ts_records_[ts_slot].last_ts_us = envelope.corrected_timestamp_us;
 
+    // ── HARD GATE LAYER (Safety Boundary) ─────────────────────────────────────
+    
+    const auto gate = hard_gate_pass(envelope, channel_state);
+
+    if (!gate.pass) {
+        // block drift logic entirely
+        suppress_drift(envelope, channel_state, gate.reason);
+        return StageResult::CONTINUE;
+    }
+
     // ── Failure Persistence State Machine (Rev 2.7 — Production Grade) ─────────
     //
     // Design invariants:
@@ -500,6 +510,35 @@ StageResult StageS7Output::process(
     envelope.failure_duration          = static_cast<uint32_t>(fs.duration_frames);
     envelope.last_failure_timestamp_us = fs.last_failure_ts_us;
 
+    // =========================================================================
+    // STRICT CONFIDENCE GATING: Final safety boundary against noise
+    // =========================================================================
+
+    // Floating-point drift clamp (defensive boundary)
+    if (!std::isfinite(envelope.failure_confidence)) {
+        envelope.failure_confidence = 0.0f;
+    } else {
+        if (envelope.failure_confidence > 1.0f) envelope.failure_confidence = 1.0f;
+        if (envelope.failure_confidence < 0.0f) envelope.failure_confidence = 0.0f;
+    }
+
+    constexpr float CONFIDENCE_FLOOR_DRIFT = 0.50f;
+    constexpr float CONFIDENCE_FLOOR_SPIKE = 0.70f;
+
+    if (envelope.failure_hint == FailureMode::DRIFT &&
+        envelope.failure_confidence < CONFIDENCE_FLOOR_DRIFT)
+    {
+        envelope.failure_hint = FailureMode::NONE;
+        envelope.failure_confidence = 0.0f;
+    }
+
+    if (envelope.failure_hint == FailureMode::SPIKE &&
+        envelope.failure_confidence < CONFIDENCE_FLOOR_SPIKE)
+    {
+        envelope.failure_hint = FailureMode::NONE;
+        envelope.failure_confidence = 0.0f;
+    }
+
     // ── Step 8: Conditional control callback ─────────────────────────────────
 
     if (quality != SampleQuality::BAD)
@@ -662,6 +701,113 @@ bool StageS7Output::evaluate_drop_gate(
     }
 
     return false;
+}
+
+
+// =============================================================================
+// hard_gate_pass()
+// =============================================================================
+
+HardGateResult StageS7Output::hard_gate_pass(
+    const MeasurementEnvelope& env,
+    const ChannelState&        cs) const noexcept
+{
+    // 1. Physical / Data Invalidity
+    if (has_flag(env.status, SampleStatus::HARD_INVALID) ||
+        !std::isfinite(env.calibrated_value) ||
+        has_flag(env.status, SampleStatus::MISSING))
+    {
+        return {false, HardGateFailReason::INVALID_DATA};
+    }
+
+    // 2. Timing Instability
+    if (env.corrected_delta_t_us == 0u ||
+        env.corrected_delta_t_us > 10u * cs.nominal_delta_t_us ||
+        has_flag(env.status, SampleStatus::TIMING_ANOMALY))
+    {
+        return {false, HardGateFailReason::TIMING_ANOMALY};
+    }
+
+    // 3. Context Instability
+    if (has_flag(env.status, SampleStatus::STALE) ||
+        has_flag(env.status, SampleStatus::INTERPOLATED))
+    {
+        return {false, HardGateFailReason::UNSTABLE_CONTEXT};
+    }
+
+    const uint64_t total = good_count_ + degraded_count_ + bad_count_ + drop_count_;
+    if (total >= 100u) 
+    {
+        if ((drop_count_ * 100u / total) > 5u || (bad_count_ * 100u / total) > 50u) 
+        {
+            return {false, HardGateFailReason::UNSTABLE_CONTEXT};
+        }
+    }
+
+    // 4. Warm-up / Insufficient History
+    if (cs.roc_n < 30u || cs.roc_prev_sample_invalid) 
+    {
+        return {false, HardGateFailReason::INSUFFICIENT_HISTORY};
+    }
+
+    // 5. Numerical Safety
+    const double dt_s = static_cast<double>(env.corrected_delta_t_us) * 1e-6;
+    if (dt_s <= 1e-9 || 
+        !std::isfinite(env.roc) || 
+        !std::isfinite(env.roc_adaptive_limit)) 
+    {
+        return {false, HardGateFailReason::NUMERICAL_FAILURE};
+    }
+
+    return {true, HardGateFailReason::NONE};
+}
+
+
+// =============================================================================
+// suppress_drift()
+// =============================================================================
+
+// static
+void StageS7Output::suppress_drift(
+    MeasurementEnvelope& env,
+    ChannelState&        cs,
+    const HardGateFailReason reason) noexcept
+{
+    // 1 & 2: Block drift scoring / anomaly output flags
+    env.status = clear_flag(env.status, SampleStatus::ROC_EXCEEDED);
+    env.status = clear_flag(env.status, SampleStatus::RATE_ANOMALY);
+
+    if (env.failure_hint == FailureMode::DRIFT || env.failure_hint == FailureMode::SPIKE) 
+    {
+        env.failure_hint       = FailureMode::NONE;
+        env.failure_confidence = 0.0f;
+        env.failure_duration   = 0u;
+    }
+
+    // 3. Set output state to BAD_CONTEXT (REJECTED) or DEGRADED
+    if (reason == HardGateFailReason::INVALID_DATA || 
+        reason == HardGateFailReason::UNSTABLE_CONTEXT || 
+        reason == HardGateFailReason::NUMERICAL_FAILURE) 
+    {
+        env.measurement_trust_tier = MeasurementTrustTier::REJECTED;
+    } 
+    else 
+    {
+        env.measurement_trust_tier = MeasurementTrustTier::DEGRADED;
+    }
+
+    // 4. Reset or freeze drift-related counters
+    cs.roc_violation_count = 0u;
+
+    if (cs.failure_state.latched_hint == FailureMode::DRIFT || 
+        cs.failure_state.latched_hint == FailureMode::SPIKE) 
+    {
+        cs.failure_state.latched_hint       = FailureMode::NONE;
+        cs.failure_state.latched_confidence = 0.0f;
+        cs.failure_state.duration_frames    = 0u;
+        cs.failure_state.enter_counter      = 0u;
+        cs.failure_state.exit_counter       = 0u;
+    }
 }
 
 

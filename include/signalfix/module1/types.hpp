@@ -160,6 +160,25 @@ enum class FailureMode : uint8_t
     INVALID = 5u,  ///< Physically impossible value (NaN, Inf, Hard bounds).
 };
 
+// =============================================================================
+// FaultState — Active vs Recovered Tracking (Rev 2.8.5)
+// =============================================================================
+
+struct FaultState {
+    bool is_active_fault;                       // true = fault currently active (status=ROC_EXCEEDED)
+    bool is_recovering;                         // true = fault detected but now decaying (status=NOMINAL, conf > 0)
+    bool recovery_confirmed;                    // true = confidence has decayed to 0.0 AND stayed there for 1+ sample
+    uint8_t _padding;                           // alignment
+    
+    uint32_t samples_since_fault_onset;         // samples elapsed since fault first detected (saturates at UINT32_MAX)
+    uint32_t fault_onset_sequence_id;           // sequence_id when fault was first detected
+    uint32_t samples_in_recovery;               // how many samples have elapsed since recovery_confirmed=true
+    
+    float confidence_at_onset;                  // failure_confidence value when ROC_EXCEEDED was first set
+    float confidence_current;                   // current failure_confidence (may be decaying)
+};
+
+
 
 // =============================================================================
 // MeasurementEnvelope — Versioned wire contract (Rev 2.4, 96 bytes)
@@ -205,9 +224,10 @@ struct MeasurementEnvelope
     uint32_t              failure_duration;       ///< Consecutive samples in current failure.
     uint64_t              last_failure_timestamp_us; ///< Time of last observed failure [μs].
     uint64_t              _pad_final_8;           ///< Padding to 128-byte boundary.
+    FaultState            fault_state;            ///< Advanced fault tracking
 };
 
-static_assert(sizeof(MeasurementEnvelope) == 128u, "MeasurementEnvelope size check failed (Rev 2.6).");
+static_assert(sizeof(MeasurementEnvelope) == 152u, "MeasurementEnvelope size check failed (Rev 2.8.5).");
 static_assert(alignof(MeasurementEnvelope) == 8u, "MeasurementEnvelope alignment check failed.");
 
 // =============================================================================
@@ -285,6 +305,15 @@ make_nominal_envelope() noexcept
     env.failure_confidence    = 0.0f;
     env.failure_duration      = 0u;
     env.last_failure_timestamp_us = 0u;
+
+    env.fault_state.is_active_fault = false;
+    env.fault_state.is_recovering = false;
+    env.fault_state.recovery_confirmed = false;
+    env.fault_state.samples_since_fault_onset = 0u;
+    env.fault_state.fault_onset_sequence_id = 0u;
+    env.fault_state.samples_in_recovery = 0u;
+    env.fault_state.confidence_at_onset = 0.0f;
+    env.fault_state.confidence_current = 0.0f;
 
     return env;
 }
