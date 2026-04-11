@@ -39,6 +39,7 @@ enum class SampleStatus : uint16_t
     STALE           = 0x0080u,  ///< Watchdog timeout (paired with MISSING).
     RATE_ANOMALY    = 0x0100u,  ///< [Rev 2.2] Deterministic rate-of-change check failure (S5).
     PRE_FILTER_OK   = 0x0200u,  ///< [Rev 2.2] Median filter successfully applied (S5).
+    DRIFT_EXCEEDED  = 0x0400u,  ///< [Rev 2.8.6] Slow drift deviation threshold exceeded (g%σ).
 };
 
 // ---------------------------------------------------------------------------
@@ -181,7 +182,7 @@ struct FaultState {
 
 
 // =============================================================================
-// MeasurementEnvelope — Versioned wire contract (Rev 2.4, 96 bytes)
+// MeasurementEnvelope — Versioned wire contract (Rev 2.4)
 // =============================================================================
 
 struct MeasurementEnvelope
@@ -217,17 +218,26 @@ struct MeasurementEnvelope
 
     SampleStatus          status;                 ///< 16-bit status flags.
     MeasurementTrustTier  measurement_trust_tier; ///< Authoritative R-tier.
+
+    // PUBLIC OUTPUT: Sanitized for external consumers (e.g. Kalman Filter, CSV).
+    // Suppressed (NONE/0.0) during recovery phase.
+    FailureMode           failure_hint;           ///< Public failure classification.
+    FailureMode           internal_failure_hint;  ///< Internal latched FailureMode.
     uint8_t               filter_window_n;        ///< Median window N.
-    FailureMode           failure_hint;           ///< Persistent failure state.
-    uint8_t               _pad_align_conf[3];     ///< Alignment padding.
-    float                 failure_confidence;     ///< Smoothed confidence [0.0, 1.0].
-    uint32_t              failure_duration;       ///< Consecutive samples in current failure.
+    uint8_t               _pad_align_conf[1];     ///< Alignment padding.
+    float                 failure_confidence;     ///< Public smoothed confidence [0.0, 1.0].
+    uint32_t              failure_duration;       ///< Public consecutive sample count.
     uint64_t              last_failure_timestamp_us; ///< Time of last observed failure [μs].
-    uint64_t              _pad_final_8;           ///< Padding to 128-byte boundary.
-    FaultState            fault_state;            ///< Advanced fault tracking
+    
+    // INTERNAL STATE: Preserves raw latched dynamics (including recovery decay) for forensic audit.
+    float                 internal_failure_confidence; ///< Latched confidence for S7 engine.
+    uint32_t              internal_failure_duration;   ///< Latched duration for S7 engine.
+    
+    FaultState            fault_state;            ///< Advanced fault tracking (Rev 2.8.5)
 };
 
-static_assert(sizeof(MeasurementEnvelope) == 152u, "MeasurementEnvelope size check failed (Rev 2.8.5).");
+// --- ABI Stability Guards (Architecture Invariants) ---
+static_assert(sizeof(MeasurementEnvelope) <= 160u, "Envelope grew unexpectedly");
 static_assert(alignof(MeasurementEnvelope) == 8u, "MeasurementEnvelope alignment check failed.");
 
 // =============================================================================
@@ -305,6 +315,10 @@ make_nominal_envelope() noexcept
     env.failure_confidence    = 0.0f;
     env.failure_duration      = 0u;
     env.last_failure_timestamp_us = 0u;
+
+    env.internal_failure_hint = FailureMode::NONE;
+    env.internal_failure_confidence = 0.0f;
+    env.internal_failure_duration = 0u;
 
     env.fault_state.is_active_fault = false;
     env.fault_state.is_recovering = false;
@@ -407,7 +421,8 @@ validate_status_flags(SampleStatus s) noexcept
     constexpr uint16_t M_VALUE_PROPS = static_cast<uint16_t>(SampleStatus::SOFT_SUSPECT)   |
                                        static_cast<uint16_t>(SampleStatus::ROC_EXCEEDED)   |
                                        static_cast<uint16_t>(SampleStatus::FILTER_CLIPPED) |
-                                       static_cast<uint16_t>(SampleStatus::RATE_ANOMALY);
+                                       static_cast<uint16_t>(SampleStatus::RATE_ANOMALY)   |
+                                       static_cast<uint16_t>(SampleStatus::DRIFT_EXCEEDED);
 
     // 2. Invariant Rules
     // -------------------------------------------------------------------------

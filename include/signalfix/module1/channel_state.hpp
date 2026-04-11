@@ -201,7 +201,11 @@ struct ChannelState
     float    roc_sigma_accumulator;        ///< [Rev 2.8.3+] Warm-up accumulator.
     uint32_t roc_normal_streak;            ///< [Rev 2.8.4] Stable nominal sample count.
     uint32_t roc_prev_violation_count;     ///< For reset confirm (2-consecutive rule).
-    uint8_t  _pad_s5b[4];                  ///< Padding for alignment.
+    bool     roc_baseline_locked;          ///< [Rev 2.9] True once baseline is frozen post-warmup.
+    uint8_t  _pad_s5b[3];                  ///< Padding for alignment.
+
+    // ── Drift Detection — g%σ Accumulator (S5, Rev 2.9) ─────────────────────
+    double   drift_gsigma;                 ///< [Rev 2.9] g%σ accumulator for slow-drift detection.
 
     // ── Gap detection (S2a, S4) ──────────────────────────────────────────────
 
@@ -319,6 +323,8 @@ inline void init_channel_state(ChannelState& cs,
     cs.roc_snapshot_m2              = 0.0;
     cs.roc_snapshot_n               = 0u;
     cs.roc_prev_violation_count     = 0u;
+    cs.roc_baseline_locked          = false;
+    cs.drift_gsigma                 = 0.0;
 
     // Failure Persistence Initialisation
     cs.failure_state.latched_hint        = FailureMode::NONE;

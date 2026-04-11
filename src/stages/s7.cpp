@@ -502,41 +502,89 @@ StageResult StageS7Output::process(
     if (fs.latched_confidence < 0.0f) fs.latched_confidence = 0.0f;
 
     // ────────────────────────────────────────────────────────────────────────
-    // OUTPUT — single authoritative write-back to the envelope
-    // Downstream stages/modules read ONLY from the envelope, never from fs.
+    // INTERNAL TIER — authoritatively latch the persistence state
     // ────────────────────────────────────────────────────────────────────────
-    envelope.failure_hint              = fs.latched_hint;
-    envelope.failure_confidence        = fs.latched_confidence;
-    envelope.failure_duration          = static_cast<uint32_t>(fs.duration_frames);
-    envelope.last_failure_timestamp_us = fs.last_failure_ts_us;
+    envelope.internal_failure_hint       = fs.latched_hint;
+    envelope.internal_failure_confidence = fs.latched_confidence;
+    envelope.internal_failure_duration   = static_cast<uint32_t>(fs.duration_frames);
+    envelope.last_failure_timestamp_us   = fs.last_failure_ts_us;
 
-    // =========================================================================
-    // STRICT CONFIDENCE GATING: Final safety boundary against noise
-    // =========================================================================
+    // ────────────────────────────────────────────────────────────────────────
+    // PUBLIC TIER — Sanitization & Recovery Suppression
+    // ────────────────────────────────────────────────────────────────────────
+    // 1. Detect recovery using internal counters (SFX-M1-TDS-001 Rev 2.9)
+    // exit_counter tracks the progression from latched failure back to nominal.
+    const bool is_recovery_phase = (fs.latched_hint != FailureMode::NONE) && 
+                                   (fs.exit_counter > 0) && 
+                                   (fs.exit_counter < kExitThreshold);
 
-    // Floating-point drift clamp (defensive boundary)
-    if (!std::isfinite(envelope.failure_confidence)) {
-        envelope.failure_confidence = 0.0f;
-    } else {
-        if (envelope.failure_confidence > 1.0f) envelope.failure_confidence = 1.0f;
-        if (envelope.failure_confidence < 0.0f) envelope.failure_confidence = 0.0f;
+    // 2. Initial mapping from internal
+    FailureMode pub_mode = fs.latched_hint;
+    float       pub_conf = fs.latched_confidence;
+    uint32_t    pub_dur  = static_cast<uint32_t>(fs.duration_frames);
+
+    // 3. SEVERITY OVERRIDE: INVALID always wins (highest priority)
+    if (has_flag(envelope.status, SampleStatus::HARD_INVALID) || !std::isfinite(envelope.calibrated_value)) 
+    {
+        pub_mode = FailureMode::INVALID;
+        pub_conf = 1.0f;
     }
 
+    // 4. RECOVERY SUPPRESSION: Silence output during internal decay window
+    // (Bypassed if step 3 promoted the mode to INVALID)
+    if (is_recovery_phase && pub_mode != FailureMode::INVALID) {
+        pub_mode = FailureMode::NONE;
+        pub_conf = 0.0f;
+        pub_dur  = 0u;
+    }
+
+    // 5. CONFIDENCE GATING: Apply floors to public output only
     constexpr float CONFIDENCE_FLOOR_DRIFT = 0.50f;
     constexpr float CONFIDENCE_FLOOR_SPIKE = 0.70f;
 
-    if (envelope.failure_hint == FailureMode::DRIFT &&
-        envelope.failure_confidence < CONFIDENCE_FLOOR_DRIFT)
-    {
-        envelope.failure_hint = FailureMode::NONE;
+    if (pub_mode == FailureMode::DRIFT && pub_conf < CONFIDENCE_FLOOR_DRIFT) {
+        pub_mode = FailureMode::NONE;
+        pub_conf = 0.0f;
+    } else if (pub_mode == FailureMode::SPIKE && pub_conf < CONFIDENCE_FLOOR_SPIKE) {
+        pub_mode = FailureMode::NONE;
+        pub_conf = 0.0f;
+    }
+
+    // 6. Final Write-back to Public Fields
+    envelope.failure_hint       = pub_mode;
+    envelope.failure_confidence = pub_conf;
+    envelope.failure_duration   = pub_dur;
+
+    // (Gating and consistency handled in Sanitization Layer above)
+
+    // ─────────────────────────────────────────────
+    // FINAL CONSISTENCY ENFORCEMENT (STRICT OUTPUT CONTRACT)
+    // MUST BE LAST BEFORE RETURN
+    // ─────────────────────────────────────────────
+
+    // Defensive: sanitize confidence
+    if (!std::isfinite(envelope.failure_confidence)) {
         envelope.failure_confidence = 0.0f;
     }
 
-    if (envelope.failure_hint == FailureMode::SPIKE &&
-        envelope.failure_confidence < CONFIDENCE_FLOOR_SPIKE)
+    if (envelope.failure_confidence > 1.0f) envelope.failure_confidence = 1.0f;
+    if (envelope.failure_confidence < 0.0f) envelope.failure_confidence = 0.0f;
+
+    // HARD INVARIANT:
+    // If no failure is reported → system must behave as NOMINAL
+    if (envelope.failure_hint == FailureMode::NONE)
     {
-        envelope.failure_hint = FailureMode::NONE;
-        envelope.failure_confidence = 0.0f;
+        // Remove ROC_EXCEEDED flag only (do NOT touch HARD_INVALID, STALE, GAP)
+        envelope.status = static_cast<SampleStatus>(
+            static_cast<uint16_t>(envelope.status) &
+            ~static_cast<uint16_t>(SampleStatus::ROC_EXCEEDED)
+        );
+
+        // Remove RATE_ANOMALY if present (optional but recommended for full consistency)
+        envelope.status = static_cast<SampleStatus>(
+            static_cast<uint16_t>(envelope.status) &
+            ~static_cast<uint16_t>(SampleStatus::RATE_ANOMALY)
+        );
     }
 
     // ── Step 8: Conditional control callback ─────────────────────────────────
@@ -782,6 +830,11 @@ void StageS7Output::suppress_drift(
         env.failure_hint       = FailureMode::NONE;
         env.failure_confidence = 0.0f;
         env.failure_duration   = 0u;
+
+        // Synchronize internal fields
+        env.internal_failure_hint       = FailureMode::NONE;
+        env.internal_failure_confidence = 0.0f;
+        env.internal_failure_duration   = 0u;
     }
 
     // 3. Set output state to BAD_CONTEXT (REJECTED) or DEGRADED
@@ -958,6 +1011,11 @@ void StageS7Output::set_hard_invalid(MeasurementEnvelope& envelope) noexcept
 
     // Rev 2.6: Use hierarchical upgrade (INVALID always wins)
     upgrade_failure_hint(envelope, FailureMode::INVALID, 1.0f);
+
+    // Rev 2.9: Synchronize internal fields to ensure immediate latch
+    envelope.internal_failure_hint       = FailureMode::INVALID;
+    envelope.internal_failure_confidence = 1.0f;
+    envelope.internal_failure_duration   = 1u; // At least one frame of failure
 }
 
 

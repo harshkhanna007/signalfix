@@ -11,6 +11,8 @@ std::string CsvWriter::format_header() {
            "status,"
            "failure_hint,"
            "failure_confidence,"
+           "internal_hint,"
+           "internal_conf,"
            "is_active_fault,"
            "is_recovering,"
            "samples_since_fault_onset,"
@@ -48,9 +50,10 @@ std::string CsvWriter::format_row(const MeasurementEnvelope& env) {
        << env.calibrated_value << ",";
        
     ss << status_to_string(env.status) << ","
-       << failure_mode_to_string(env.failure_hint) << ",";
-       
-    ss << std::fixed << std::setprecision(2) << env.failure_confidence << ","
+       << failure_mode_to_string(env.failure_hint) << ","
+       << std::fixed << std::setprecision(2) << env.failure_confidence << ","
+       << failure_mode_to_string(env.internal_failure_hint) << ","
+       << std::fixed << std::setprecision(2) << env.internal_failure_confidence << ","
        << (env.fault_state.is_active_fault ? "true" : "false") << ","
        << (env.fault_state.is_recovering ? "true" : "false") << ","
        << env.fault_state.samples_since_fault_onset << ","

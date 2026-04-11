@@ -3,14 +3,14 @@
 // File   : src/signalfix_runtime.cpp
 // Spec   : SFX-M1-TDS-001  Revision 2.8.4 (Baseline-Gated)
 // =============================================================================
-
+#include <fstream>
+#include <sstream>
 #include "signalfix/module1/types.hpp"
 #include "signalfix/module1/stages/stage_s5_rate_of_change.hpp"
 #include "signalfix/module1/stages/s7.hpp"
 #include "signalfix/module1/channel_state.hpp"
 #include "signalfix/module1/output_types.hpp"
 #include "signalfix/module1/interpretation_layer.hpp"
-
 #include <vector>
 #include <cstdio>
 #include <cmath>
@@ -239,6 +239,53 @@ void run_stream_scenario(const char* name, int samples_n, double baseline, doubl
 int main() 
 {
     std::puts("\n=== SIGNALFIX AI MODULE 1 (REV 2.8.4 0.1% TIER CERTIFICATION) ===");
-    run_stream_scenario("FORENSIC_SPIKE_TEST", 50, 2048.0, 5.0, 35, 3500.0);
-    return 0;
+    std::ifstream file("train_FD001.txt");
+std::string line;
+
+ChannelState ch = make_channel_state();
+
+uint64_t time = 1000000;
+uint64_t dt = 1000000; // 1 second
+std::vector<RawSample> samples;
+int current_engine = -1;
+while (std::getline(file, line)) {
+std::stringstream ss(line);
+
+int engine_id, cycle;
+double s1, s2, s3;
+
+ss >> engine_id >> cycle >> s1 >> s2 >> s3;
+
+double sensors[21];
+for (int i = 0; i < 21; i++) {
+    ss >> sensors[i];
+}
+
+double value = sensors[2];
+
+if (current_engine == -1)
+    current_engine = engine_id;
+
+// 🔥 ENGINE CHANGE DETECTED
+if (engine_id != current_engine) {
+    run_stream_core("ENGINE", samples.data(), samples.size(), ch);
+
+    samples.clear();
+    ch = make_channel_state();
+    current_engine = engine_id;
+}
+
+RawSample sample;
+sample.raw = value;
+sample.time_us = time;
+samples.push_back(sample);
+
+time += dt;
+}
+
+// 🔥 PROCESS LAST ENGINE (CRITICAL)
+if (!samples.empty()) {
+    run_stream_core("ENGINE", samples.data(), samples.size(), ch);
+} 
+return 0;
 }

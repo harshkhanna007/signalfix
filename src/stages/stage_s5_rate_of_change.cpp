@@ -117,11 +117,15 @@ StageResult StageS5RateOfChange::process(
     // // STEP 3: [EQUILIBRIUM LAYER] — Base-Frame Frame Gating
     // =========================================================================
     if (channel_state.roc_n < config_.warm_up_samples) {
+        // Accumulate sigma only during warm-up; baseline remains unset.
         channel_state.roc_sigma_accumulator += static_cast<float>(sigma);
-        channel_state.roc_sigma_baseline = 0.0f; 
-    } else if (channel_state.roc_n == config_.warm_up_samples) {
-        channel_state.roc_sigma_baseline = channel_state.roc_sigma_accumulator / static_cast<float>(config_.warm_up_samples);
+    } else if (channel_state.roc_n == config_.warm_up_samples && !channel_state.roc_baseline_locked) {
+        // Compute baseline exactly once at warm-up completion, then freeze it.
+        channel_state.roc_sigma_baseline =
+            channel_state.roc_sigma_accumulator / static_cast<float>(config_.warm_up_samples);
+        channel_state.roc_baseline_locked = true;
     }
+    // Baseline is immutable after lock — no updates below this point.
 
     // =========================================================================
     // // STEP 4: [INFERENCE PATH] — Governed Adaptive Thresholding
@@ -178,9 +182,10 @@ StageResult StageS5RateOfChange::process(
         if (channel_state.roc_violation_count >= 2u) {
             envelope.status |= SampleStatus::ROC_EXCEEDED;
 
+            // ROC detection path → SPIKE only. DRIFT is exclusively owned by g%σ accumulator.
             const double conf_range = std::max(0.0, (raw_roc_safe / threshold - 1.0));
             float suggested_conf = static_cast<float>(std::fmin(0.6, std::fmax(0.3, conf_range)));
-            upgrade_failure_hint(envelope, FailureMode::DRIFT, suggested_conf);
+            upgrade_failure_hint(envelope, FailureMode::SPIKE, suggested_conf);
         }
     } else {
         envelope.status = clear_flag(envelope.status, SampleStatus::ROC_EXCEEDED);
@@ -191,8 +196,12 @@ StageResult StageS5RateOfChange::process(
     // STEP 5.5: [FAULT STATE TRACKER] — Distinguish Active vs. Recovering
     // =========================================================================
 
-    const bool is_active_now = has_flag(envelope.status, SampleStatus::ROC_EXCEEDED);
-    const bool is_nominal_now = (envelope.status == SampleStatus::NOMINAL);
+    const bool is_active_now = 
+        has_flag(envelope.status, SampleStatus::ROC_EXCEEDED) ||
+        has_flag(envelope.status, SampleStatus::DRIFT_EXCEEDED);
+    const bool is_nominal_now = 
+        !has_flag(envelope.status, SampleStatus::ROC_EXCEEDED) &&
+        !has_flag(envelope.status, SampleStatus::DRIFT_EXCEEDED);
     const float current_conf = envelope.failure_confidence;
 
     // Case 1: NEW FAULT ONSET (transition from healthy to ROC_EXCEEDED)
@@ -291,7 +300,7 @@ StageResult StageS5RateOfChange::process(
     // We reject learning when values drastically diverge from the expected bounds
     const bool is_outlier = (raw_roc_safe > (learning_limit * 3.0)) || !std::isfinite(bounded_roc);
     
-    if (!is_outlier) {
+    if (!is_outlier && envelope.status == SampleStatus::NOMINAL) {
         const double alpha = config_.alpha_learning; 
         channel_state.roc_n++;
         const double diff_old = bounded_roc - mean;
@@ -305,23 +314,44 @@ StageResult StageS5RateOfChange::process(
     }
 
     // [Rev 2.8.5] Stability Tracking
-    if (envelope.status == SampleStatus::NOMINAL) {
-        channel_state.roc_normal_streak++;
-    } else {
-        channel_state.roc_normal_streak = 0u;
-    }
+    if (!has_flag(envelope.status, SampleStatus::ROC_EXCEEDED) &&
+    !has_flag(envelope.status, SampleStatus::DRIFT_EXCEEDED)) {
+    channel_state.roc_normal_streak++;
+} else {
+    channel_state.roc_normal_streak = 0u;
+}
 
     // =========================================================================
-    // // STEP 7: [ROOT CORRECTION] — Gated Baseline Learning
+    // // STEP 7: [g%σ DRIFT DETECTION] — Slow Degradation Accumulator
     // =========================================================================
-    const bool is_pure = (envelope.status == SampleStatus::NOMINAL);
-    const bool is_post_warmup = (channel_state.roc_n > config_.warm_up_samples);
+    if (channel_state.roc_baseline_locked) {
+        // Numerically safe: baseline is clamped to sigma_min (> 0) to prevent div/0.
+        const double baseline = std::max(
+            static_cast<double>(channel_state.roc_sigma_baseline),
+            static_cast<double>(config_.sigma_min)
+        );
 
-    if (is_pure && (channel_state.roc_normal_streak >= 30u) && is_post_warmup) {
-        // Only update baseline after 30 consecutive normal samples to prevent learning from transient noise
-        const double beta_b = config_.beta_baseline;
-        const double b_old  = static_cast<double>(channel_state.roc_sigma_baseline);
-        channel_state.roc_sigma_baseline = static_cast<float>((1.0 - beta_b) * b_old + beta_b * sigma);
+        // g%σ step: fractional deviation of current sigma from frozen baseline.
+        const double g_step = std::abs(sigma - baseline) / baseline;
+
+        // Guard: only accumulate finite values (protects against NaN propagation).
+        if (std::isfinite(g_step)) {
+            channel_state.drift_gsigma += g_step;
+        }
+
+        // Drift detection trigger: sustained fractional deviation exceeds threshold.
+        const double DRIFT_THRESHOLD = 3.0 * static_cast<double>(config_.warm_up_samples);
+        if (channel_state.drift_gsigma > DRIFT_THRESHOLD) {
+            upgrade_failure_hint(envelope, FailureMode::DRIFT, 0.9f);
+            envelope.status |= SampleStatus::DRIFT_EXCEEDED;
+        }
+
+        // Controlled decay: bleed off accumulator when signal has been stable for 20+ samples.
+        if (channel_state.roc_normal_streak > 20) {
+            if (!has_flag(envelope.status, SampleStatus::DRIFT_EXCEEDED)) {
+                channel_state.drift_gsigma *= 0.98;
+            }
+        }
     }
 
     // Final bookkeeping
