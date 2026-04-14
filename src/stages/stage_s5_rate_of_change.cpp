@@ -130,7 +130,41 @@ StageResult StageS5RateOfChange::process(
     // =========================================================================
     // // STEP 4: [INFERENCE PATH] — Governed Adaptive Thresholding
     // =========================================================================
+    
+    // [Rev 3.4] Hardened Dual-Condition Learning Gate & Stable Reference
+    // Gating ref is decoupled from instantaneous sigma to prevent recursive feedback.
+    const double gating_ref = std::max((double)channel_state.roc_smoothed_sigma, (double)config_.sigma_min);
+    const double dev_norm_gate = std::abs(physical_deviation_pre) / std::max(1e-6, gating_ref);
+
+    const bool is_centered = (dev_norm_gate < 0.75); // Tight centrality requirement
+    const bool is_healthy = (channel_state.drift_gsigma < 0.5); // Tight health requirement
+    
+    if (is_centered && is_healthy) {
+        channel_state.roc_learning_streak++;
+    } else {
+        channel_state.roc_learning_streak = 0u;
+    }
+    
+    // Only update noise model if signal has been stable and centered for 8 consecutive frames
+    const bool learning_stable = (channel_state.roc_learning_streak >= 8u);
+
+    if (learning_stable) {
+        if (channel_state.roc_smoothed_sigma == 0.0f) {
+            channel_state.roc_smoothed_sigma = static_cast<float>(sigma);
+            channel_state.roc_mad = static_cast<float>(std::abs(physical_deviation_pre));
+        } else {
+            channel_state.roc_smoothed_sigma = 
+                0.98f * channel_state.roc_smoothed_sigma + 0.02f * static_cast<float>(sigma);
+            
+            // Robust MAD update: clip contribution to 2.0 sigma to neutralize outliers
+            const double contribution = std::min(std::abs(physical_deviation_pre), gating_ref * 2.0);
+            channel_state.roc_mad = 0.99f * channel_state.roc_mad + 0.01f * static_cast<float>(contribution);
+        }
+    }
+
+
     double sigma_eff = sigma;
+
     if (channel_state.roc_sigma_baseline > 0.0f) {
         const double b = static_cast<double>(channel_state.roc_sigma_baseline);
         sigma_eff = std::fmin(b * config_.sigma_max_ratio, std::fmax(b * config_.sigma_min_ratio, sigma));
@@ -306,10 +340,11 @@ StageResult StageS5RateOfChange::process(
     const double mom_threshold = 0.4;
 
     // Composite Learning Gate
-    const bool learning_allowed = 
+    const bool learning_allowed = !warmup_complete || (
         (envelope.status == SampleStatus::NOMINAL) &&
         (channel_state.drift_gsigma < drift_cutoff) &&
-        (channel_state.samples_since_drift_clear > RECOVERY_HOLD_SAMPLES);
+        (channel_state.samples_since_drift_clear > RECOVERY_HOLD_SAMPLES)
+    );
 
     if (!is_outlier && learning_allowed) {
         // Conservative Mode: Throttled learning post-baseline lock
@@ -342,15 +377,14 @@ StageResult StageS5RateOfChange::process(
     // 7a. Stability-Gated Baseline Locking (Issue 3 Fix)
     const double BASELINE_WARMUP_SAMPLES = 25.0;
     if (!channel_state.drift_baseline_locked) {
-        const double noise_floor = std::max(static_cast<double>(channel_state.roc_sigma_baseline), static_cast<double>(config_.sigma_min));
         
         // Condition: Stability Gate (Relaxed from NOMINAL-only)
         const bool is_phys_valid = !has_flag(envelope.status, SampleStatus::HARD_INVALID) && 
                                    !has_flag(envelope.status, SampleStatus::MISSING);
         const bool is_stable = is_phys_valid && (channel_state.roc_normal_streak >= 5u);
         
-        // Condition: Health Validation (Relaxed variance check)
-        const bool is_healthy = (sigma <= noise_floor * 5.0);
+        // Condition: Health Validation (Scale-Aware Health Gate)
+        const bool is_healthy = (sigma <= static_cast<double>(final_limit) * 1.5);
         
         if (is_stable && is_healthy) {
             channel_state.drift_baseline_samples++;
@@ -362,13 +396,9 @@ StageResult StageS5RateOfChange::process(
             }
         }
         
-        // Forced Activation Fallback: Ensure system never stays inactive
-        else if (channel_state.roc_n > BASELINE_WARMUP_SAMPLES * 2.0) {
-            if (channel_state.drift_baseline_samples > 0) {
-                channel_state.drift_baseline /= channel_state.drift_baseline_samples;
-            } else {
-                channel_state.drift_baseline = channel_state.roc_mean;
-            }
+        // Bootstrapped Initialization: Ensure system picks up correct mean
+        else if (channel_state.roc_n >= config_.warm_up_samples) {
+            channel_state.drift_baseline = channel_state.roc_mean;
             channel_state.drift_baseline_locked = true;
         }
     }
@@ -378,16 +408,23 @@ StageResult StageS5RateOfChange::process(
         const double baseline = channel_state.drift_baseline;
         double physical_deviation = raw_roc_safe - baseline;
 
-        // Enforce physical noise floor to prevent div by zero
+        // Enforce physical noise floor to prevent div by zero (Dynamic Normalization)
         const double epsilon_floor = 1e-6;
-        const double nf_safe = std::max({static_cast<double>(channel_state.roc_sigma_baseline), 
+        const double nf_safe = std::max({static_cast<double>(channel_state.roc_smoothed_sigma), 
                                          static_cast<double>(config_.sigma_min), 
                                          epsilon_floor});
         
         // Convert to Normalized Sigma Space
         double dev_norm = physical_deviation / nf_safe;
         if (!std::isfinite(dev_norm)) { dev_norm = 0.0; }
-        dev_norm = 5.0 * std::tanh(dev_norm / 5.0); // Soft clamp to reject heavy impulses
+        
+        // [Rev 3.3] Huber Bounding (Outlier Compression)
+        // Linear up to 3.0, logarithmic beyond to squash spikes non-destructively.
+        if (std::abs(dev_norm) > 3.0) {
+            dev_norm = 3.0 * std::copysign(1.0, dev_norm) + 
+                       std::log(1.0 + std::abs(dev_norm) - 3.0) * std::copysign(1.0, dev_norm);
+        }
+
 
         const double ALPHA = 0.5; // Momentum smoothing factor (more responsive)
         channel_state.drift_momentum = ALPHA * channel_state.drift_momentum + (1.0 - ALPHA) * dev_norm;
@@ -396,9 +433,16 @@ StageResult StageS5RateOfChange::process(
         channel_state.drift_momentum = std::clamp(channel_state.drift_momentum, -MOMENTUM_LIMIT, MOMENTUM_LIMIT);
 
         // 7c. Noise-Aware Adaptive Slack (Normalized space)
-        const double current_noise_normalized = sigma / nf_safe;
-        const double base_slack = 0.05;
-        const double k_slack = base_slack + 0.05 * current_noise_normalized; // Adaptive slack based on local noise
+        // [Rev 3.4] Rate-Limited Adaptive Slack (MAD-derived)
+        const double mad_ratio = static_cast<double>(channel_state.roc_mad) / nf_safe;
+        const double target_slack = std::clamp(mad_ratio + 0.05, 0.75, 0.95);
+        
+        // Prevent slack from jumping more than 0.001 per frame to maintain CUSUM stability
+        const double delta_slack = std::clamp(target_slack - channel_state.drift_smoothed_slack, -0.001, 0.001);
+        channel_state.drift_smoothed_slack += static_cast<float>(delta_slack);
+        const double k_slack = channel_state.drift_smoothed_slack;
+
+
 
         // 7e. CUSUM Accumulation (Leaky Integrator)
         const double gamma = 1.0 / std::max(1.0, static_cast<double>(config_.drift_memory_samples));
@@ -413,16 +457,33 @@ StageResult StageS5RateOfChange::process(
         // 7f. Signal Export & Trigger (Latched Hysteresis)
         channel_state.drift_gsigma = std::max(channel_state.drift_cusum_pos, channel_state.drift_cusum_neg);
 
-        const double DRIFT_ON_THRES = 12.0; 
-        const double DRIFT_OFF_THRES = 4.0;
+        // [Rev 3.4] Generalized Mathematical Thresholds & Guarding
+        const double SENSITIVITY_MIN = 0.20;
+        const double SENSITIVITY_MAX = 0.60;
+        const double drift_sensitivity_sigma = std::clamp(0.35, SENSITIVITY_MIN, SENSITIVITY_MAX);
         
+        const double DRIFT_ON_THRES = std::max(5.0, drift_sensitivity_sigma / gamma);
+        const double DRIFT_OFF_THRES = DRIFT_ON_THRES * 0.4;
+        
+        if (channel_state.drift_gsigma >= DRIFT_ON_THRES) {
+            channel_state.drift_trigger_persistence += 1.0f;
+        } else {
+            // [Rev 3.4] Balanced Persistence Decay: Soft linear decay (max 0.25 at zero)
+            // This prevents evidence 'erasure' deep in nominal while responding to gaps.
+            const double ratio = channel_state.drift_gsigma / DRIFT_ON_THRES;
+            const float decay = static_cast<float>((1.0 - ratio) * 0.25);
+            channel_state.drift_trigger_persistence = std::max(0.0f, channel_state.drift_trigger_persistence - decay);
+        }
+
+
         if (!channel_state.drift_active) {
-            if (channel_state.drift_gsigma > DRIFT_ON_THRES) {
+            if (channel_state.drift_trigger_persistence >= 3.0f) {
                 channel_state.drift_active = true;
             }
         } else {
             if (channel_state.drift_gsigma < DRIFT_OFF_THRES) {
                 channel_state.drift_active = false;
+                channel_state.drift_trigger_persistence = 0.0f;
             }
         }
 
@@ -432,6 +493,7 @@ StageResult StageS5RateOfChange::process(
         } else {
             envelope.status = clear_flag(envelope.status, SampleStatus::DRIFT_EXCEEDED);
         }
+
     }
 
     // --- Update Recovery Guard ---

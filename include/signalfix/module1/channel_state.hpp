@@ -213,6 +213,13 @@ struct ChannelState
     bool     drift_active;                 ///< [Rev 3.2] Stateful drift hysteresis flag.
     uint32_t drift_baseline_samples;       ///< [Rev 3.0] Counter for stable samples collected.
     uint32_t samples_since_drift_clear;    ///< [Rev 3.1] Persistence counter for recovery guard.
+    float    roc_smoothed_sigma;           ///< [Rev 3.3] EMA-stabilized noise scale. S5.
+    float    roc_mad;                      ///< [Rev 3.3] Mean Absolute Deviation tracker. S5.
+    float    drift_trigger_persistence;     ///< [Rev 3.3] Fractional persistence accumulator. S5.
+    uint32_t roc_learning_streak;          ///< [Rev 3.4] Stability gate for noise learning. S5.
+    float    drift_smoothed_slack;         ///< [Rev 3.4] Rate-limited adaptive slack. S5.
+
+
     
     // ── Drift Persistence & Arbitration (S5.5) ───────────────────────────────
     float    drift_persistence_time_s;     ///< Time-accumulated drift (seconds).
@@ -348,6 +355,13 @@ inline void init_channel_state(ChannelState& cs,
     cs.drift_active                 = false;
     cs.drift_baseline_samples       = 0u;
     cs.samples_since_drift_clear    = 500u; // Start high to allow learning on boot.
+    cs.roc_smoothed_sigma           = 0.0f;
+    cs.roc_mad                      = 0.0f;
+    cs.drift_trigger_persistence    = 0.0f;
+    cs.roc_learning_streak          = 0u;
+    cs.drift_smoothed_slack         = 0.85f;
+
+
     
     cs.drift_persistence_time_s     = 0.0f;
     cs.drift_clear_time_s           = 0.0f;

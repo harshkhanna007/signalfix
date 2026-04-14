@@ -574,10 +574,11 @@ StageResult StageS7Output::process(
     // If no failure is reported → system must behave as NOMINAL
     if (envelope.failure_hint == FailureMode::NONE)
     {
-        // Remove ROC_EXCEEDED flag only (do NOT touch HARD_INVALID, STALE, GAP)
+        // Remove ROC_EXCEEDED flag AND DRIFT_EXCEEDED flag (Clean Sweep)
         envelope.status = static_cast<SampleStatus>(
             static_cast<uint16_t>(envelope.status) &
-            ~static_cast<uint16_t>(SampleStatus::ROC_EXCEEDED)
+            ~static_cast<uint16_t>(SampleStatus::ROC_EXCEEDED) &
+            ~static_cast<uint16_t>(SampleStatus::DRIFT_EXCEEDED)
         );
 
         // Remove RATE_ANOMALY if present (optional but recommended for full consistency)
