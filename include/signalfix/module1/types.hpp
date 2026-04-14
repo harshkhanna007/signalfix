@@ -308,6 +308,7 @@ struct MeasurementEnvelope
     
     // CONTINUOUS METRICS
     float                 drift_score;                 ///< Continuous drift severity metric [0, 100].
+    float                 drift_gsigma;                ///< Raw CUSUM gSigma exported from S5 for severity mapping.
     
     FaultState            fault_state;            ///< Advanced fault tracking (Rev 2.8.5)
 };
@@ -362,6 +363,7 @@ make_nominal_envelope() noexcept
     env.internal_failure_duration = 0u;
 
     env.drift_score           = 0.0f;
+    env.drift_gsigma          = 0.0f;
 
     env.fault_state.is_active_fault = false;
     env.fault_state.is_recovering = false;

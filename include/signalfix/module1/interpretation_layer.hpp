@@ -150,7 +150,8 @@ struct TextRecord
 [[nodiscard]] inline SeverityLevel
 compute_severity(const FailureMode  mode,
                  const uint32_t     duration,
-                 const float        confidence) noexcept
+                 const float        confidence,
+                 const float        gsigma = 0.0f) noexcept
 {
     switch (mode)
     {
@@ -168,11 +169,12 @@ compute_severity(const FailureMode  mode,
             return                         SeverityLevel::LOW;
 
         case FailureMode::DRIFT:
-            if (duration > 60u)                          return SeverityLevel::CRITICAL;
-            if (duration > 20u)                          return SeverityLevel::HIGH;
-            if (duration >  5u && confidence >= 0.6f)    return SeverityLevel::HIGH;
-            if (duration >  5u)                          return SeverityLevel::MEDIUM;
-            return                                              SeverityLevel::LOW;
+            // Severity depends ONLY on gSigma — no duration fallbacks.
+            // Thresholds aligned with S5's DRIFT_ON (12.0) and DRIFT_OFF (4.0).
+            if (gsigma >= 20.0f) return SeverityLevel::CRITICAL;
+            if (gsigma >= 12.0f) return SeverityLevel::HIGH;
+            if (gsigma >=  4.0f) return SeverityLevel::MEDIUM;
+            return                      SeverityLevel::LOW;
 
         case FailureMode::STALE:
             if (duration > 15u) return SeverityLevel::CRITICAL;
@@ -303,7 +305,6 @@ interpret(const MeasurementEnvelope& env,
     InterpretationReport r{};
 
     // ── Edge Case Guard: Duration Overflow (SFX-M1-TDS-023) ────────────────────
-    // Clamps to 999,999 to prevent 32-bit wrap during long-running streams.
     const uint32_t kMaxSafeDuration = 999999u;
     uint32_t safe_duration = env.failure_duration;
     if (safe_duration > kMaxSafeDuration)
@@ -312,7 +313,21 @@ interpret(const MeasurementEnvelope& env,
     }
 
     // ── Step 1: Copy raw fields with hardening ──────────────────────────────
-    r.failure_type     = env.failure_hint;
+    // STATE CONSISTENCY: failure_type is derived from the status bitmask ONLY.
+    // We never infer drift from failure_hint alone — the bitmask is the
+    // single source of truth.
+    const bool system_in_drift = has_flag(env.status, SampleStatus::DRIFT_EXCEEDED);
+
+    // Synchronize failure_type with envelope bitmask.
+    if (system_in_drift) {
+        r.failure_type = FailureMode::DRIFT;
+    } else if (env.failure_hint == FailureMode::DRIFT) {
+        // Status says no drift, but hint says drift — bitmask wins.
+        r.failure_type = FailureMode::NONE;
+    } else {
+        r.failure_type = env.failure_hint;
+    }
+
     r.raw_confidence   = env.failure_confidence;
     r.duration_samples = safe_duration;
     r.input_valid      = true;
@@ -326,10 +341,10 @@ interpret(const MeasurementEnvelope& env,
     if (conf_is_nan || conf_is_inf || out_of_range)
     {
         r.input_valid      = false;
-        r.raw_confidence   = 0.0f; // Safe clamp
+        r.raw_confidence   = 0.0f;
         r.confidence_level = ConfidenceLevel::LOW;
         if (conf_is_inf || out_of_range) {
-            r.failure_type = FailureMode::INVALID; // Escalate non-physical confidence to INVALID
+            r.failure_type = FailureMode::INVALID;
         }
     }
     else
@@ -337,9 +352,7 @@ interpret(const MeasurementEnvelope& env,
         r.confidence_level = interp_detail::map_confidence(env.failure_confidence);
     }
 
-    // ── Step 3: Invariant Enforcement (Coherent State Resolver) ────────────────
-    
-    // Invariant: NONE mode MUST NOT have a non-zero duration or high confidence.
+    // ── Step 3: Invariant Enforcement ────────────────────────────────────────
     if (r.failure_type == FailureMode::NONE)
     {
         if (r.duration_samples > 0u || r.raw_confidence > 0.05f) {
@@ -349,29 +362,23 @@ interpret(const MeasurementEnvelope& env,
         }
     }
 
-    // Invariant: INVALID mode MUST be CRITICAL regardless of other metadata.
     if (r.failure_type == FailureMode::INVALID)
     {
         r.severity = SeverityLevel::CRITICAL;
         if (r.raw_confidence < 0.99f && !conf_is_nan) {
-            r.state_coherent = false; // INVALID implies 1.0 trust logically.
+            r.state_coherent = false;
         }
     }
 
-    // ── Step 4: Hierarchical Severity Layer (HARD > DATA > SIGNAL) ─────────────
+    // ── Step 4: Severity (gSigma-based for DRIFT; existing logic for others) ──
     if (r.failure_type == FailureMode::INVALID)
     {
         r.severity = SeverityLevel::CRITICAL;
     }
-    else if (r.failure_type == FailureMode::STALE || r.failure_type == FailureMode::GAP)
-    {
-        // Data absence/timing is higher priority than statistical signal logic.
-        r.severity = interp_detail::compute_severity(r.failure_type, r.duration_samples, r.raw_confidence);
-    }
     else
     {
-        // Signal logic (DROOP/SPIKE/DRIFT)
-        r.severity = interp_detail::compute_severity(r.failure_type, r.duration_samples, r.raw_confidence);
+        r.severity = interp_detail::compute_severity(
+            r.failure_type, r.duration_samples, r.raw_confidence, env.drift_gsigma);
     }
 
     r.stability = interp_detail::compute_stability(
@@ -381,7 +388,7 @@ interpret(const MeasurementEnvelope& env,
     {
         r.title      = "State Anomaly Detected";
         r.summary    = "Failure state is internally inconsistent. Diagnostic accuracy is reduced.";
-        r.diagnostic = "Pipeline stages may be emitting contradictory outputs. Possible causes: memory corruption, S7 state machine reset, or a pending recovery not yet confirmed.";
+        r.diagnostic = "Pipeline stages may be emitting contradictory outputs.";
     }
     else
     {
@@ -473,13 +480,13 @@ to_string(const ActionHint a) noexcept
 {
     switch (a)
     {
-        case ActionHint::NONE:                 return "NONE";
-        case ActionHint::MONITOR:              return "MONITOR";
-        case ActionHint::INVESTIGATE:          return "INVESTIGATE";
-        case ActionHint::URGENT_CHECK:         return "URGENT_CHECK";
-        case ActionHint::RECALIBRATE_REQUIRED: return "RECALIBRATE_REQUIRED";
-        case ActionHint::STOP_INSPECT:         return "STOP_AND_INSPECT";
-        default:                               return "STOP_AND_INSPECT";
+        case ActionHint::NONE:                 return "No action";
+        case ActionHint::MONITOR:              return "Monitor";
+        case ActionHint::INVESTIGATE:          return "Monitor";
+        case ActionHint::URGENT_CHECK:         return "Schedule maintenance soon";
+        case ActionHint::RECALIBRATE_REQUIRED: return "Schedule maintenance soon";
+        case ActionHint::STOP_INSPECT:         return "Immediate action required";
+        default:                               return "Immediate action required";
     }
 }
 
@@ -627,6 +634,197 @@ log_interpretation_smart(const int                   sample_index,
     std::printf("          dur=%-3u | conf=%s(%.2f)\n", r.duration_samples, interp_detail::to_cstr(r.confidence_level), static_cast<double>(r.raw_confidence));
     std::printf("          Cause:  %s\n", r.diagnostic);
     std::printf("          Action: %s\n", to_string(state.peak_action));
+}
+
+// =============================================================================
+// Trend Indicator — Qualitative trajectory of the anomaly
+// =============================================================================
+
+struct ChannelTrendState {
+    static constexpr int kWindowSize = 5;
+    float buffer[kWindowSize] = {0.0f};
+    int head = 0;
+    int count = 0;
+
+    // Inertia/Persistence
+    int pending_rising_count = 0;
+    int pending_falling_count = 0;
+    const char* confirmed_trend = "Stable";
+};
+
+inline void update_trend_state(ChannelTrendState& state, float gsigma) noexcept {
+    state.buffer[state.head] = gsigma;
+    state.head = (state.head + 1) % ChannelTrendState::kWindowSize;
+    if (state.count < ChannelTrendState::kWindowSize) state.count++;
+}
+
+[[nodiscard]] inline const char* compute_trend_label(ChannelTrendState& state, bool in_drift, float current_gsigma) noexcept {
+    // Rule 1: Not in drift -> Always Stable
+    if (!in_drift) {
+        state.confirmed_trend = "Stable";
+        state.pending_rising_count = 0;
+        state.pending_falling_count = 0;
+        return "Stable";
+    }
+
+    // Rule 2: Minimum history required (buffer must be full)
+    if (state.count < ChannelTrendState::kWindowSize) {
+        return "Stable";
+    }
+
+    // Rule 3: Smoothing. Compare newest 2 vs oldest 2 in the 5-sample window.
+    // indices relative to head: (head-1, head-2) vs (head-4, head-5)
+    auto get_idx = [](int head, int offset) {
+        return (head + ChannelTrendState::kWindowSize + offset) % ChannelTrendState::kWindowSize;
+    };
+
+    float avg_new = (state.buffer[get_idx(state.head, -1)] + state.buffer[get_idx(state.head, -2)]) / 2.0f;
+    float avg_old = (state.buffer[get_idx(state.head, -4)] + state.buffer[get_idx(state.head, -5)]) / 2.0f;
+    float delta = avg_new - avg_old;
+
+    // Rule 4: Adaptive Deadband
+    float threshold = std::max(0.01f, 0.02f * current_gsigma);
+
+    // Rule 5: Inertia (3 consecutive confirmations)
+    if (delta > threshold) {
+        state.pending_rising_count++;
+        state.pending_falling_count = 0;
+        if (state.pending_rising_count >= 3) {
+            state.confirmed_trend = "Rising";
+        }
+    } else if (delta < -threshold) {
+        state.pending_falling_count++;
+        state.pending_rising_count = 0;
+        if (state.pending_falling_count >= 3) {
+            state.confirmed_trend = "Falling";
+        }
+    } else {
+        state.pending_rising_count = 0;
+        state.pending_falling_count = 0;
+        state.confirmed_trend = "Stable";
+    }
+
+    // Rule 6: Conservative Safety Mask (No falling during active drift)
+    if (std::strcmp(state.confirmed_trend, "Falling") == 0) {
+        return "Stable";
+    }
+
+    return state.confirmed_trend;
+}
+
+// =============================================================================
+// Drift Severity Label — Maps internal SeverityLevel to customer-facing string
+// =============================================================================
+
+[[nodiscard]] constexpr const char*
+drift_severity_label(const SeverityLevel s) noexcept
+{
+    switch (s)
+    {
+        case SeverityLevel::INFO:     return "Normal operation";
+        case SeverityLevel::LOW:      return "Early deviation detected";
+        case SeverityLevel::MEDIUM:   return "Significant drift detected";
+        case SeverityLevel::HIGH:     return "Significant drift detected";
+        case SeverityLevel::CRITICAL: return "Severe degradation detected";
+        default:                      return "Status unknown";
+    }
+}
+
+// ── Decision Matrix for Drift Recommendations ──────────────────────────────
+[[nodiscard]] inline const char*
+generate_drift_recommendation(SeverityLevel s,
+                            const char*   trend,
+                            float         confidence,
+                            uint32_t      duration) noexcept
+{
+    const bool is_rising  = (std::strcmp(trend, "Rising") == 0);
+    const bool is_falling = (std::strcmp(trend, "Falling") == 0);
+
+    // 1. CONFIDENCE GATE: LOW (Strictly non-actionable)
+    if (confidence < 0.15f) {
+        if (s == SeverityLevel::CRITICAL) {
+            return "Strong signal forming. Monitoring closely to confirm severity.";
+        }
+        return "Early signal detected. Monitoring to confirm persistence.";
+    }
+
+    // 2. TREND OVERRIDE: FALLING (Do not clear fault)
+    if (is_falling) {
+        return "Trend is falling but severity remains high. Continue monitoring to confirm recovery.";
+    }
+
+    // 3. DURATION GATE: MEDIUM CONFIDENCE (< 10 samples)
+    if (confidence < 0.65f && duration < 10u) {
+        return "Signal is developing. Continue monitoring to confirm progression.";
+    }
+
+    // 4. SEVERITY DOMINANCE: CRITICAL (High/Medium Confidence)
+    if (s == SeverityLevel::CRITICAL) {
+        return "Severe degradation confirmed. Immediate inspection required.";
+    }
+
+    // 5. HIGH SEVERITY MATRIX
+    if (s >= SeverityLevel::MEDIUM) {
+        if (confidence >= 0.65f) {
+            if (is_rising) return "Significant drift is worsening. Maintenance should be scheduled soon.";
+            return "Significant drift confirmed. Evaluate recalibration at next opportunity.";
+        } else {
+            // Medium confidence (Duration >= 10 handled by step 3)
+            if (is_rising) return "Trend is actively worsening. Maintenance may be required if condition persists.";
+            return "Condition sustained. Action may be required at next opportunity.";
+        }
+    }
+
+    // 6. WARNING/INFO (Low tier)
+    if (confidence >= 0.65f) return "Early deviation confirmed. Evaluate sensor health during next cycle.";
+    return "Early deviation detected. Monitoring to confirm progression.";
+}
+
+// =============================================================================
+// print_final_drift_report() — Mandated 34-dash diagnostic block output.
+// Only prints when system_in_drift is true (DRIFT_EXCEEDED bitmask set).
+// =============================================================================
+
+inline void
+print_final_drift_report(const MeasurementEnvelope&  env,
+                         const InterpretationReport& r,
+                         const char*                 sensor_name,
+                         const float                 drift_confidence,
+                         const char*                 trend_label) noexcept
+{
+    const bool system_in_drift = has_flag(env.status, SampleStatus::DRIFT_EXCEEDED);
+    if (!system_in_drift) return;
+
+    const char* severity_str = drift_severity_label(r.severity);
+    const char* recommendation = generate_drift_recommendation(
+        r.severity, trend_label, drift_confidence, r.duration_samples);
+
+    const char* display_severity = severity_str;
+    const char* display_trend    = trend_label;
+
+    // ── Early-Phase Consistency Override ─────────────────────────────────────
+    // During emergence (duration < 10), we communicate uncertainty and state-alignment.
+    if (r.duration_samples < 10u) {
+        display_severity = "Drift signal detected (developing)";
+        display_trend    = "Developing";
+    }
+
+    // Enhanced Confidence Wording
+    const char* conf_context = "N/A";
+    if (drift_confidence < 0.15f)      conf_context = "Low (early signal)";
+    else if (drift_confidence < 0.65f) conf_context = "Medium (confirmed trend)";
+    else                               conf_context = "High (strong persistence)";
+
+    std::printf("----------------------------------\n");
+    std::printf("STATUS: DRIFT DETECTED\n");
+    std::printf("Sensor: %s\n",        sensor_name);
+    std::printf("Severity: %s\n",      display_severity);
+    std::printf("Confidence: %s\n",    conf_context);
+    std::printf("Trend: %s\n",         display_trend);
+    std::printf("----------------------------------\n");
+    std::printf("Recommendation:\n");
+    std::printf("%s\n",                recommendation);
+    std::printf("----------------------------------\n");
 }
 
 } // namespace signalfix

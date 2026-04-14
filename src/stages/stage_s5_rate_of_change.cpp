@@ -445,9 +445,9 @@ StageResult StageS5RateOfChange::process(
     envelope.roc_window_n = static_cast<uint16_t>(std::min<uint32_t>(channel_state.roc_n, 0xFFFFu));
     channel_state.last_calibrated_value = envelope.calibrated_value;
 
-    printf("[S5-DEBUG] Seq: %u | Locked: %d | Mom: %.4f | gSigma: %.4f\n",
-           envelope.sequence_id, channel_state.drift_baseline_locked, 
-           channel_state.drift_momentum, channel_state.drift_gsigma);
+    // Export gSigma so the interpretation layer can map severity without
+    // needing access to ChannelState. S5 is the sole writer of this value.
+    envelope.drift_gsigma = static_cast<float>(channel_state.drift_gsigma);
 
     return StageResult::CONTINUE;
 }

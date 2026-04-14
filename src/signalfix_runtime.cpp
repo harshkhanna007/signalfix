@@ -96,6 +96,59 @@ static signalfix::ChannelState make_channel_state() noexcept {
     return ch;
 }
 struct RawSample { uint64_t time_us; double raw; };
+
+// ---------------------------------------------------------------------------
+// Sensor Identity — Centralized mapping from channel_id to physical name.
+// Add entries here when new channels are configured. No magic indices needed.
+// ---------------------------------------------------------------------------
+struct SensorChannelConfig {
+    uint32_t    channel_id;
+    int         dataset_column_index; // 0-based column in the sensor block
+    const char* sensor_name;
+};
+
+// NASA C-MAPSS FD001: columns 0-20 in the sensor block after s1/s2/s3.
+// Only channel 0x0003 is currently active in this build.
+static const SensorChannelConfig SENSOR_MAP[] = {
+    { 0x0001u,  0, "T2 (Fan Inlet Temp)"         },
+    { 0x0002u,  1, "T24 (LPC Outlet Temp)"        },
+    { 0x0003u,  2, "T30 (HPC Temperature)"        },
+    { 0x0004u,  3, "T50 (LPT Outlet Temp)"        },
+    { 0x0005u,  4, "P2 (Fan Inlet Pressure)"      },
+    { 0x0006u,  5, "P15 (Bypass-duct Pressure)"   },
+    { 0x0007u,  6, "P30 (HPC Outlet Pressure)"    },
+    { 0x0008u,  7, "Nf (Fan Speed)"               },
+    { 0x0009u,  8, "Nc (Core Speed)"              },
+    { 0x000Au,  9, "epr (Engine Pressure Ratio)"  },
+    { 0x000Bu, 10, "Ps30 (Static HPC Pressure)"   },
+    { 0x000Cu, 11, "phi (Fuel-Air Ratio)"         },
+    { 0x000Du, 12, "NRf (Corrected Fan Speed)"    },
+    { 0x000Eu, 13, "NRc (Corrected Core Speed)"   },
+    { 0x000Fu, 14, "BPR (Bypass Ratio)"           },
+    { 0x0010u, 15, "farB (Burner Fuel-Air Ratio)" },
+    { 0x0011u, 16, "htBleed (Bleed Enthalpy)"     },
+    { 0x0012u, 17, "Nf_dmd (Fan Speed Demand)"    },
+    { 0x0013u, 18, "PCNfR_dmd (PC NfR Demand)"    },
+    { 0x0014u, 19, "W31 (HPT Coolant Bleed)"      },
+    { 0x0015u, 20, "W32 (LPT Coolant Bleed)"      },
+};
+static constexpr int SENSOR_MAP_SIZE = static_cast<int>(sizeof(SENSOR_MAP) / sizeof(SENSOR_MAP[0]));
+
+[[nodiscard]] inline const char*
+get_sensor_name(uint32_t channel_id) noexcept {
+    for (int i = 0; i < SENSOR_MAP_SIZE; ++i) {
+        if (SENSOR_MAP[i].channel_id == channel_id) return SENSOR_MAP[i].sensor_name;
+    }
+    return "Unknown Sensor";
+}
+
+[[nodiscard]] inline int
+get_sensor_column(uint32_t channel_id) noexcept {
+    for (int i = 0; i < SENSOR_MAP_SIZE; ++i) {
+        if (SENSOR_MAP[i].channel_id == channel_id) return SENSOR_MAP[i].dataset_column_index;
+    }
+    return 2; // safe fallback to T30
+}
 const char* describe_status(signalfix::SampleStatus s) noexcept {
     using S = signalfix::SampleStatus;
     if (signalfix::has_flag(s, S::STALE)) return "STALE       ";
@@ -172,9 +225,9 @@ void run_stream_core(const char* name, const RawSample* samples, int n, signalfi
     static const signalfix::InterpretationConfig interp_cfg{};
 
     // Change-detection state for smart logging.
-    // One instance per stream: reset on every run_stream_core() call.
-    // Lives on the stack. Not static — must reset between streams.
     signalfix::InterpretationPrintState print_state{};
+    // Trend evaluation state.
+    signalfix::ChannelTrendState trend_state{};
 
     std::printf(" STREAM: %s (Rev 2.8.4 0.1%% Tier Certified)\n", name);
     std::puts(" ─────────────────────────────────────────────────────────────────────────────────────────────────────────────");
@@ -221,8 +274,20 @@ void run_stream_core(const char* name, const RawSample* samples, int n, signalfi
         const signalfix::InterpretationReport interp =
             signalfix::interpret(env, interp_cfg);
 
+        // ── Trend Indicator ─────────────────────────────────────────────────
+        // State-aware smoothing and inertia. Managed strictly in presentation.
+        const bool system_in_drift = signalfix::has_flag(env.status, signalfix::SampleStatus::DRIFT_EXCEEDED);
+        signalfix::update_trend_state(trend_state, env.drift_gsigma);
+        const char* trend_label = signalfix::compute_trend_label(trend_state, system_in_drift, env.drift_gsigma);
+
         log_sample_full(i, env, ch, {signalfix::derive_classification(env), (float)rr});
         log_interpretation_smart(i, interp, print_state);
+
+        // Final diagnostic block — fires on every sample where drift is active.
+        // Printed after smart log to avoid interleaving.
+        if (system_in_drift) {
+            print_final_drift_report(env, interp, get_sensor_name(ch.channel_id), ch.drift_confidence, trend_label);
+        }
     }
 }
 
@@ -267,7 +332,9 @@ for (int i = 0; i < 21; i++) {
     ss >> sensors[i];
 }
 
-double value = sensors[2];
+// Resolve sensor column from the channel config — no magic indices.
+const int col = get_sensor_column(ch.channel_id);
+const double value = (col >= 0 && col < 21) ? sensors[col] : sensors[2];
 
 if (current_engine == -1)
     current_engine = engine_id;
