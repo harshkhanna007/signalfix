@@ -7,6 +7,7 @@
 #include <sstream>
 #include "signalfix/module1/types.hpp"
 #include "signalfix/module1/stages/stage_s5_rate_of_change.hpp"
+#include "signalfix/module1/stages/stage_s5_5.hpp"
 #include "signalfix/module1/stages/s7.hpp"
 #include "signalfix/module1/channel_state.hpp"
 #include "signalfix/module1/output_types.hpp"
@@ -80,6 +81,8 @@ const char* describe_classification(signalfix::Classification c) noexcept {
         // NO_DATA: watchdog fired, sensor is not delivering samples.
         case C::NO_DATA:       return "NO_DATA      ";
 
+        case C::DRIFT:         return "DRIFT       ";
+
         default:               return "UNKNOWN      ";
     }
 }
@@ -99,6 +102,7 @@ const char* describe_status(signalfix::SampleStatus s) noexcept {
     if (signalfix::has_flag(s, S::HARD_INVALID)) return "HARD_INVALID";
     if (signalfix::has_flag(s, S::MISSING)) return "MISSING     ";
     if (signalfix::has_flag(s, S::ROC_EXCEEDED)) return "ROC_EXCEEDED";
+    if (signalfix::has_flag(s, S::DRIFT_EXCEEDED)) return "DRIFT_EXCEEDED";
     return "NOMINAL     ";
 }
 
@@ -160,6 +164,7 @@ void run_stream_core(const char* name, const RawSample* samples, int n, signalfi
     
     log_configuration_audit(s5_config);
     StageS5RateOfChange s5_stage(s5_config);
+    StageS55DriftPersistence s55_stage;
     
     StageS7Output s7_stage(noop_processed_output, nullptr);
 
@@ -205,6 +210,7 @@ void run_stream_core(const char* name, const RawSample* samples, int n, signalfi
         }
 
         (void)s5_stage.process(env, ch);
+        (void)s55_stage.process(env, ch);
         stage_s6_packager(env, ch);
         
         (void)s7_stage.process(env, ch);

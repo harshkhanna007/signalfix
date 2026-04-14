@@ -292,16 +292,30 @@ StageResult StageS5RateOfChange::process(
     }
 
     // =========================================================================
-    // // STEP 6: [LEARNING PATH] — Online State Update
+    // // STEP 6: [LEARNING PATH] — Hardened Online State Update (Rev 3.1)
     // =========================================================================
     const bool warmup_complete = (channel_state.roc_n >= config_.warm_up_samples);
     const double learning_limit = warmup_complete ? static_cast<double>(final_limit) : config_.fallback_limit;
-    
-    // We reject learning when values drastically diverge from the expected bounds
     const bool is_outlier = (raw_roc_safe > (learning_limit * 3.0)) || !std::isfinite(bounded_roc);
-    
-    if (!is_outlier && envelope.status == SampleStatus::NOMINAL) {
-        const double alpha = config_.alpha_learning; 
+
+    // Hardened Logic Constants
+    const uint32_t RECOVERY_HOLD_SAMPLES = 15u;
+    const uint32_t STABILITY_STREAK_THRESHOLD = 8u;
+    // Limits in Sigma Space
+    const double drift_cutoff = 0.5;
+    const double mom_threshold = 0.4;
+
+    // Composite Learning Gate
+    const bool learning_allowed = 
+        (envelope.status == SampleStatus::NOMINAL) &&
+        (channel_state.drift_gsigma < drift_cutoff) &&
+        (channel_state.samples_since_drift_clear > RECOVERY_HOLD_SAMPLES);
+
+    if (!is_outlier && learning_allowed) {
+        // Conservative Mode: Throttled learning post-baseline lock
+        const double alpha_scale = channel_state.drift_baseline_locked ? 0.5 : 1.0;
+        const double alpha = config_.alpha_learning * alpha_scale; 
+
         channel_state.roc_n++;
         const double diff_old = bounded_roc - mean;
         channel_state.roc_mean += static_cast<float>(alpha * diff_old);
@@ -322,41 +336,118 @@ StageResult StageS5RateOfChange::process(
 }
 
     // =========================================================================
-    // // STEP 7: [g%σ DRIFT DETECTION] — Slow Degradation Accumulator
+    // STEP 7: [TREND-AWARE DRIFT DETECTION] — Momentum-CUSUM Architecture
     // =========================================================================
-    if (channel_state.roc_baseline_locked) {
-        // Numerically safe: baseline is clamped to sigma_min (> 0) to prevent div/0.
-        const double baseline = std::max(
-            static_cast<double>(channel_state.roc_sigma_baseline),
-            static_cast<double>(config_.sigma_min)
-        );
-
-        // g%σ step: fractional deviation of current sigma from frozen baseline.
-        const double g_step = std::abs(sigma - baseline) / baseline;
-
-        // Guard: only accumulate finite values (protects against NaN propagation).
-        if (std::isfinite(g_step)) {
-            channel_state.drift_gsigma += g_step;
-        }
-
-        // Drift detection trigger: sustained fractional deviation exceeds threshold.
-        const double DRIFT_THRESHOLD = 3.0 * static_cast<double>(config_.warm_up_samples);
-        if (channel_state.drift_gsigma > DRIFT_THRESHOLD) {
-            upgrade_failure_hint(envelope, FailureMode::DRIFT, 0.9f);
-            envelope.status |= SampleStatus::DRIFT_EXCEEDED;
-        }
-
-        // Controlled decay: bleed off accumulator when signal has been stable for 20+ samples.
-        if (channel_state.roc_normal_streak > 20) {
-            if (!has_flag(envelope.status, SampleStatus::DRIFT_EXCEEDED)) {
-                channel_state.drift_gsigma *= 0.98;
+    
+    // 7a. Stability-Gated Baseline Locking (Issue 3 Fix)
+    const double BASELINE_WARMUP_SAMPLES = 25.0;
+    if (!channel_state.drift_baseline_locked) {
+        const double noise_floor = std::max(static_cast<double>(channel_state.roc_sigma_baseline), static_cast<double>(config_.sigma_min));
+        
+        // Condition: Stability Gate (Relaxed from NOMINAL-only)
+        const bool is_phys_valid = !has_flag(envelope.status, SampleStatus::HARD_INVALID) && 
+                                   !has_flag(envelope.status, SampleStatus::MISSING);
+        const bool is_stable = is_phys_valid && (channel_state.roc_normal_streak >= 5u);
+        
+        // Condition: Health Validation (Relaxed variance check)
+        const bool is_healthy = (sigma <= noise_floor * 5.0);
+        
+        if (is_stable && is_healthy) {
+            channel_state.drift_baseline_samples++;
+            channel_state.drift_baseline += raw_roc_safe;
+            
+            if (channel_state.drift_baseline_samples >= static_cast<uint32_t>(BASELINE_WARMUP_SAMPLES)) {
+                channel_state.drift_baseline /= BASELINE_WARMUP_SAMPLES;
+                channel_state.drift_baseline_locked = true;
             }
         }
+        
+        // Forced Activation Fallback: Ensure system never stays inactive
+        else if (channel_state.roc_n > BASELINE_WARMUP_SAMPLES * 2.0) {
+            if (channel_state.drift_baseline_samples > 0) {
+                channel_state.drift_baseline /= channel_state.drift_baseline_samples;
+            } else {
+                channel_state.drift_baseline = channel_state.roc_mean;
+            }
+            channel_state.drift_baseline_locked = true;
+        }
+    }
+
+    // 7b. Trend Extraction & Momentum (Issue 4 Fix: Block warmup accumulation)
+    if (channel_state.drift_baseline_locked) {
+        const double baseline = channel_state.drift_baseline;
+        double physical_deviation = raw_roc_safe - baseline;
+
+        // Enforce physical noise floor to prevent div by zero
+        const double epsilon_floor = 1e-6;
+        const double nf_safe = std::max({static_cast<double>(channel_state.roc_sigma_baseline), 
+                                         static_cast<double>(config_.sigma_min), 
+                                         epsilon_floor});
+        
+        // Convert to Normalized Sigma Space
+        double dev_norm = physical_deviation / nf_safe;
+        if (!std::isfinite(dev_norm)) { dev_norm = 0.0; }
+        dev_norm = 5.0 * std::tanh(dev_norm / 5.0); // Soft clamp to reject heavy impulses
+
+        const double ALPHA = 0.5; // Momentum smoothing factor (more responsive)
+        channel_state.drift_momentum = ALPHA * channel_state.drift_momentum + (1.0 - ALPHA) * dev_norm;
+
+        const double MOMENTUM_LIMIT = 3.0;
+        channel_state.drift_momentum = std::clamp(channel_state.drift_momentum, -MOMENTUM_LIMIT, MOMENTUM_LIMIT);
+
+        // 7c. Noise-Aware Adaptive Slack (Normalized space)
+        const double current_noise_normalized = sigma / nf_safe;
+        const double base_slack = 0.05;
+        const double k_slack = base_slack + 0.05 * current_noise_normalized; // Adaptive slack based on local noise
+
+        // 7e. CUSUM Accumulation (Leaky Integrator)
+        const double gamma = 1.0 / std::max(1.0, static_cast<double>(config_.drift_memory_samples));
+        channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * (1.0 - gamma) + channel_state.drift_momentum - k_slack);
+        channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * (1.0 - gamma) - channel_state.drift_momentum - k_slack);
+
+        // Limit values to prevent explosion
+        const double MAX_CUSUM = 50.0;
+        channel_state.drift_cusum_pos = std::min(channel_state.drift_cusum_pos, MAX_CUSUM);
+        channel_state.drift_cusum_neg = std::min(channel_state.drift_cusum_neg, MAX_CUSUM);
+
+        // 7f. Signal Export & Trigger (Latched Hysteresis)
+        channel_state.drift_gsigma = std::max(channel_state.drift_cusum_pos, channel_state.drift_cusum_neg);
+
+        const double DRIFT_ON_THRES = 12.0; 
+        const double DRIFT_OFF_THRES = 4.0;
+        
+        if (!channel_state.drift_active) {
+            if (channel_state.drift_gsigma > DRIFT_ON_THRES) {
+                channel_state.drift_active = true;
+            }
+        } else {
+            if (channel_state.drift_gsigma < DRIFT_OFF_THRES) {
+                channel_state.drift_active = false;
+            }
+        }
+
+        if (channel_state.drift_active) {
+            upgrade_failure_hint(envelope, FailureMode::DRIFT, 0.9f);
+            envelope.status |= SampleStatus::DRIFT_EXCEEDED;
+        } else {
+            envelope.status = clear_flag(envelope.status, SampleStatus::DRIFT_EXCEEDED);
+        }
+    }
+
+    // --- Update Recovery Guard ---
+    if (channel_state.drift_gsigma < 0.2) { // Practical recovery threshold
+        channel_state.samples_since_drift_clear++;
+    } else {
+        channel_state.samples_since_drift_clear = 0u;
     }
 
     // Final bookkeeping
     envelope.roc_window_n = static_cast<uint16_t>(std::min<uint32_t>(channel_state.roc_n, 0xFFFFu));
     channel_state.last_calibrated_value = envelope.calibrated_value;
+
+    printf("[S5-DEBUG] Seq: %u | Locked: %d | Mom: %.4f | gSigma: %.4f\n",
+           envelope.sequence_id, channel_state.drift_baseline_locked, 
+           channel_state.drift_momentum, channel_state.drift_gsigma);
 
     return StageResult::CONTINUE;
 }

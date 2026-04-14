@@ -21,9 +21,8 @@
 //   64 channels           :         ≈ 40 KB  (fits comfortably in L2 cache)
 //
 // =============================================================================
-
+#include "signalfix/module1/types.hpp"
 #pragma once
-
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -206,6 +205,22 @@ struct ChannelState
 
     // ── Drift Detection — g%σ Accumulator (S5, Rev 2.9) ─────────────────────
     double   drift_gsigma;                 ///< [Rev 2.9] g%σ accumulator for slow-drift detection.
+    double   drift_cusum_pos;              ///< [Rev 2.10] CUSUM positive trend accumulator
+    double   drift_cusum_neg;              ///< [Rev 2.10] CUSUM negative trend accumulator
+    double   drift_momentum;               ///< [Rev 3.0] EWMA of directional deviation.
+    double   drift_baseline;               ///< [Rev 3.0] Stability-gated locked baseline.
+    bool     drift_baseline_locked;        ///< [Rev 3.0] True once baseline is frozen.
+    bool     drift_active;                 ///< [Rev 3.2] Stateful drift hysteresis flag.
+    uint32_t drift_baseline_samples;       ///< [Rev 3.0] Counter for stable samples collected.
+    uint32_t samples_since_drift_clear;    ///< [Rev 3.1] Persistence counter for recovery guard.
+    
+    // ── Drift Persistence & Arbitration (S5.5) ───────────────────────────────
+    float    drift_persistence_time_s;     ///< Time-accumulated drift (seconds).
+    float    drift_clear_time_s;           ///< Consecutive clear time (seconds).
+    DriftLevel drift_level;                ///< Current DriftLevel enum.
+    uint8_t  _pad_s55[3];                  ///< Padding for alignment.
+    float    drift_confidence;             ///< Last computed confidence [0,1].
+    float    drift_score;                  ///< Continuous drift severity metric [0, 100].
 
     // ── Gap detection (S2a, S4) ──────────────────────────────────────────────
 
@@ -325,6 +340,20 @@ inline void init_channel_state(ChannelState& cs,
     cs.roc_prev_violation_count     = 0u;
     cs.roc_baseline_locked          = false;
     cs.drift_gsigma                 = 0.0;
+    cs.drift_cusum_pos              = 0.0;
+    cs.drift_cusum_neg              = 0.0;
+    cs.drift_momentum               = 0.0;
+    cs.drift_baseline               = 0.0;
+    cs.drift_baseline_locked        = false;
+    cs.drift_active                 = false;
+    cs.drift_baseline_samples       = 0u;
+    cs.samples_since_drift_clear    = 500u; // Start high to allow learning on boot.
+    
+    cs.drift_persistence_time_s     = 0.0f;
+    cs.drift_clear_time_s           = 0.0f;
+    cs.drift_level                  = DriftLevel::NOISE;
+    cs.drift_confidence             = 0.0f;
+    cs.drift_score                  = 0.0f;
 
     // Failure Persistence Initialisation
     cs.failure_state.latched_hint        = FailureMode::NONE;

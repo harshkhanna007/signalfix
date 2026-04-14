@@ -33,6 +33,7 @@ struct RocDetectionConfig
     double   beta_down{0.05};      ///< [Inference] Fall rate (Fast-Correction)
     double   beta_baseline{0.001}; ///< [Equilibrium] Long-term anchor (1,000-sample)
     uint32_t warm_up_samples{30u};
+    uint32_t drift_memory_samples{33u};  ///< [Rev 3.2] Sample memory length for drift scaling
     double   fallback_limit{NOMINAL_SPIKE_LIMIT};
 
     // --- STABILIZATION GOVERNOR ---
