@@ -113,7 +113,7 @@ StageResult StageS5RateOfChange::process(
     const double var  = channel_state.roc_m2;
     const double sigma = std::sqrt(std::max(var, static_cast<double>(config_.sigma_min * config_.sigma_min)));
 
-    // =========================================================================
+    // =========================================================================    
     // // STEP 3: [EQUILIBRIUM LAYER] — Base-Frame Frame Gating
     // =========================================================================
     if (channel_state.roc_n < config_.warm_up_samples) {
@@ -126,7 +126,7 @@ StageResult StageS5RateOfChange::process(
         channel_state.roc_baseline_locked = true;
     }
     // Baseline is immutable after lock — no updates below this point.
-
+     
     // =========================================================================
     // // STEP 4: [INFERENCE PATH] — Governed Adaptive Thresholding
     // =========================================================================
@@ -134,6 +134,8 @@ StageResult StageS5RateOfChange::process(
     // [Rev 3.4] Hardened Dual-Condition Learning Gate & Stable Reference
     // Gating ref is decoupled from instantaneous sigma to prevent recursive feedback.
     const double gating_ref = std::max((double)channel_state.roc_smoothed_sigma, (double)config_.sigma_min);
+   // Compute deviation relative to mean (safe early approximation)
+    const double physical_deviation_pre = bounded_roc - mean;
     const double dev_norm_gate = std::abs(physical_deviation_pre) / std::max(1e-6, gating_ref);
 
     const bool is_centered = (dev_norm_gate < 0.75); // Tight centrality requirement
@@ -426,10 +428,10 @@ StageResult StageS5RateOfChange::process(
         }
 
 
-        const double ALPHA = 0.5; // Momentum smoothing factor (more responsive)
+        const double ALPHA = 0.75; // Balanced smoothing (previously 0.5)
         channel_state.drift_momentum = ALPHA * channel_state.drift_momentum + (1.0 - ALPHA) * dev_norm;
 
-        const double MOMENTUM_LIMIT = 3.0;
+        const double MOMENTUM_LIMIT = 2.0; // Preserves real drift, caps pathological outliers
         channel_state.drift_momentum = std::clamp(channel_state.drift_momentum, -MOMENTUM_LIMIT, MOMENTUM_LIMIT);
 
         // 7c. Noise-Aware Adaptive Slack (Normalized space)
@@ -444,10 +446,44 @@ StageResult StageS5RateOfChange::process(
 
 
 
-        // 7e. CUSUM Accumulation (Leaky Integrator)
+        // 7e. CUSUM Accumulation (Final Precision Refined Multi-Path)
         const double gamma = 1.0 / std::max(1.0, static_cast<double>(config_.drift_memory_samples));
-        channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * (1.0 - gamma) + channel_state.drift_momentum - k_slack);
-        channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * (1.0 - gamma) - channel_state.drift_momentum - k_slack);
+        const double momentum = channel_state.drift_momentum;
+
+        // [Refinement 1]: Magnitude Gate (Zero-Stability)
+        const double MAG_THRESHOLD = 0.05;
+        const bool has_energy = (std::abs(dev_norm) > MAG_THRESHOLD) && (std::abs(momentum) > MAG_THRESHOLD);
+
+        // [Refinement 2]: Normalized Alignment & Confidence
+        double alignment = 0.0;
+        if (has_energy) {
+            const double mag_prod = std::abs(dev_norm) * std::abs(momentum);
+            alignment = (dev_norm * momentum) / mag_prod;
+        }
+
+        const double SOFT_EPSILON = 0.10;      // Jitter tolerance (Refined)
+        const double MIN_CONF_THRES = 0.05;    // Confidence floor (Refined)
+        const bool is_agreeing = (alignment > -SOFT_EPSILON);
+        const bool is_confident = (alignment > MIN_CONF_THRES);
+
+        // [Refinement 3]: Early Bounded Injection
+        const double cusum_input = std::clamp(std::abs(momentum), 0.0, 1.5);
+        const double decay_factor = (1.0 - gamma);
+
+        // [Refinement 4]: Final Gated Path Selection
+        if (has_energy && is_agreeing && is_confident) {
+            if (momentum > 0.0) {
+                channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor + cusum_input - k_slack);
+                channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor - k_slack);
+            } else {
+                channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor - k_slack);
+                channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor + cusum_input - k_slack);
+            }
+        } else {
+            // Explicit Decay-Only Path for conflicts, gaps, or insufficient confidence
+            channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor - k_slack);
+            channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor - k_slack);
+        }
 
         // Limit values to prevent explosion
         const double MAX_CUSUM = 50.0;
@@ -477,7 +513,7 @@ StageResult StageS5RateOfChange::process(
 
 
         if (!channel_state.drift_active) {
-            if (channel_state.drift_trigger_persistence >= 3.0f) {
+            if (channel_state.drift_trigger_persistence >= 8.0f) {
                 channel_state.drift_active = true;
             }
         } else {
