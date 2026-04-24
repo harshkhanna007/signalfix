@@ -1,80 +1,127 @@
-SignalFix AI
-A real-time signal integrity system for noisy industrial sensor data. Monitors statistical drift, detects persistent anomalies, and maintains temporal context to separate genuine degradation from measurement noise.
+# SignalFix AI
 
-The Problem
-Industrial sensors fail gradually, not suddenly. A temperature probe doesn't jump from 100°C to 500°C — it drifts by 0.3% per hour over three days. By the time traditional threshold-based monitoring catches it, you've lost a $2M pharmaceutical batch.
-Real-world sensor data has:
+A real-time signal integrity system for noisy industrial sensor data.
 
-Clock jitter — timestamps drift, samples arrive late or out of order
-Dropouts — sensors go silent for milliseconds to seconds
-Gradual drift — calibration degrades slowly, below alert thresholds
-Transient noise — EMI spikes, vibration, thermal effects
+SignalFix monitors statistical drift, detects persistent anomalies, and maintains temporal context to separate genuine system degradation from measurement noise.
 
-Fixed thresholds can't distinguish between a sensor dying and a noisy measurement environment. You either tolerate false alarms or miss real failures.
+---
 
-The Solution
-SignalFix sits between raw sensor streams and downstream systems (process controllers, predictive models, SCADA). It provides:
+## The Problem
 
-Adaptive thresholding — Learns baseline statistics per channel, adjusts limits dynamically
-Temporal reasoning — Tracks persistence (how long), not just magnitude (how much)
-Multi-stage validation — Calibration → gap detection → plausibility → ROC monitoring → drift arbitration
-State classification — NOMINAL / DRIFT_EXCEEDED with confidence scoring
-Timestamp correction — PLL-based clock alignment to handle jitter and dropouts
+Industrial sensors rarely fail instantly. They degrade slowly.
 
-The system doesn't just flag anomalies — it differentiates between "sensor spiked once" and "sensor has been degrading for 90 seconds."
+A temperature probe might drift 0.3% per hour over several days. By the time fixed-threshold systems detect it, the damage is already done.
 
-What Makes It Different
-Adaptive + Temporal + System Thinking
+Real-world sensor data suffers from:
 
-Not rule-based: Thresholds adjust to local conditions (mean, variance, ROC history)
-Not instant-only: Persistence accumulators distinguish transient noise from sustained drift
-Not isolated: Multi-stage pipeline validates data integrity before statistical analysis
+* Clock jitter (irregular timestamps, out-of-order samples)
+* Dropouts (missing data for milliseconds to seconds)
+* Gradual drift (calibration degradation below alert thresholds)
+* Transient noise (EMI spikes, vibration, thermal effects)
 
-Design Philosophy: "AI assists, math decides"
+Traditional monitoring systems rely on static thresholds. These cannot distinguish between a failing sensor and a noisy environment.
 
-Adaptive algorithms tune parameters (deadbands, thresholds)
-Deterministic state machines enforce decisions (NOMINAL ↔ DRIFT transitions)
-No black-box inference — every decision is traceable to measurable signal properties
+---
 
+## The Solution
 
-Current Capabilities (Module 1 Prototype)
-Signal Preprocessing Pipeline (9 stages, ~3,200 lines C++)
-StageFunctionS0Input validation, arrival timestampingS1Linear calibration (gain/offset correction)S2aGap pre-detection (missing samples)S2bPLL-based timestamp correctionS3Plausibility bounds (hard/soft limits)S4Gap classification (minor/major/critical)S5Rate-of-change monitoring (adaptive ROC thresholds)S5.5Drift persistence arbitration (time-based hysteresis)S7Output packaging, quality classification
-Key Features Implemented:
+SignalFix sits between raw sensor streams and downstream systems (controllers, models, SCADA).
 
-CUSUM-style drift accumulator (drift_gsigma)
-Adaptive deadband expansion (noise-floor tracking)
-Asymmetric hysteresis (4-level drift classification: NOISE → BUILDUP → CONFIRMED → CRITICAL)
-Confidence scoring from persistence + ROC + statistical deviation
-Monotonic timestamp enforcement
-20/20 invariant tests passing, 14/14 trust tier tests passing
+It provides:
 
+* Adaptive thresholding based on real-time signal statistics
+* Temporal reasoning (tracks persistence, not just magnitude)
+* Multi-stage validation pipeline for signal integrity
+* Stateful classification (NOMINAL / DRIFT_EXCEEDED)
+* Timestamp correction using PLL-based alignment
 
-Example Behavior
-Scenario: Temperature sensor drifts 2.5°C over 3 minutes
-[S5] ch=0x00010203 seq=1823: rr=0.0082°C/s T_roc=0.012 NOMINAL (streak=0)
-[S5] ch=0x00010203 seq=1824: rr=0.0091°C/s T_roc=0.012 NOMINAL (streak=0)
-[S5] ch=0x00010203 seq=1825: rr=0.0098°C/s T_roc=0.012 NOMINAL (streak=0)
-...
-[S5] ch=0x00010203 seq=1912: rr=0.0134°C/s T_roc=0.013 ⚠ DRIFT (streak=1, persist=0.5s)
-[S5] ch=0x00010203 seq=1913: rr=0.0141°C/s T_roc=0.013 ⚠ DRIFT (streak=2, persist=1.0s)
-...
-[S5.5] BUILDUP → CONFIRMED (persist=2.8s, conf=0.67, gsigma=4.2)
-What this shows:
+The system does not just detect anomalies.
+It determines whether the signal is **temporarily noisy or consistently degrading**.
 
-rr = instantaneous rate of change (°C/s)
-T_roc = adaptive threshold (grows with local variance)
-streak = consecutive samples with ROC > threshold
-persist = wall-clock duration of sustained drift
-gsigma = CUSUM accumulator (fractional standard deviations)
+---
 
-The system flags DRIFT only after sustained elevation (2.8 seconds), not from a single noisy sample. Confidence increases as persistence + statistical evidence accumulate.
-Status
-Prototype, not production.
+## What Makes It Different
 
-✅ Core algorithms implemented and tested
-✅ Passes invariant + trust tier test suites
-✅ Hardened against NaN/Inf, clock anomalies, missing samples
-⚠ No customer deployments yet
-⚠ No ground-truth validation on real industrial datasets
-⚠ C-MAPSS turbofan data used for development (aerospace, not pharma/food/chemical)
+### Adaptive + Temporal + System-Level Thinking
+
+* Thresholds evolve with signal behavior (mean, variance, ROC history)
+* Detection is based on **persistence over time**, not instant spikes
+* Multi-stage pipeline validates data before statistical decisions
+
+### Design Philosophy
+
+> AI assists, math decides
+
+* Adaptive logic tunes thresholds and sensitivity
+* Deterministic state machines enforce final decisions
+* No black-box inference — all outputs are traceable
+
+---
+
+## Current Capabilities (Module 1 Prototype)
+
+Signal Preprocessing Pipeline (9 stages, ~3,200 lines C++):
+
+* Input validation and timestamping
+* Calibration (gain/offset correction)
+* Gap detection and classification
+* PLL-based timestamp correction
+* Plausibility validation (hard/soft bounds)
+* Adaptive rate-of-change monitoring
+* Drift persistence arbitration
+* Output classification and quality tagging
+
+### Key Features
+
+* CUSUM-style drift accumulation (gsigma)
+* Adaptive deadband expansion (noise-floor tracking)
+* Asymmetric hysteresis (NOISE → BUILDUP → CONFIRMED → CRITICAL)
+* Confidence scoring based on persistence + statistical deviation
+* Monotonic timestamp enforcement
+
+Validation:
+
+* 20/20 invariant tests passed
+* 14/14 trust-tier tests passed
+
+---
+
+## Example Behavior
+
+**Scenario:** Temperature sensor drifts 2.5°C over 3 minutes
+
+* Initial samples remain NOMINAL as drift is small
+* Adaptive threshold evolves with local variance
+* Sustained increase in rate-of-change triggers drift detection
+* System transitions from BUILDUP → CONFIRMED based on persistence
+
+Key signals:
+
+* `rr` → instantaneous rate of change
+* `T_roc` → adaptive threshold
+* `streak` → consecutive threshold violations
+* `persist` → duration of sustained deviation
+* `gsigma` → cumulative statistical drift
+
+SignalFix flags drift only after **consistent deviation over time**, not from isolated spikes.
+
+---
+
+## Status
+
+Prototype system, not production-ready.
+
+* Core algorithms implemented and validated
+* Robust against NaN/Inf, missing data, and clock anomalies
+* No real industrial deployment yet
+* Developed using C-MAPSS turbofan dataset (aerospace domain)
+
+---
+
+## Why This Exists
+
+Most systems focus on making better decisions.
+
+SignalFix focuses on something more fundamental:
+
+**ensuring the data those decisions rely on is actually trustworthy.**
