@@ -435,9 +435,15 @@ StageResult StageS5RateOfChange::process(
         channel_state.drift_momentum = std::clamp(channel_state.drift_momentum, -MOMENTUM_LIMIT, MOMENTUM_LIMIT);
 
         // 7c. Noise-Aware Adaptive Slack (Normalized space)
-        // [Rev 3.4] Rate-Limited Adaptive Slack (MAD-derived)
+        // [Rev 3.5] Rate-Limited Adaptive Slack (MAD-derived)
+        // [SURGICAL FIX 2]: Slack floor reduced from [0.75, 0.95] → [0.20, 0.50].
+        // Prior range guaranteed net CUSUM input was near-zero or negative for all
+        // real-world drift (cusum_input≈0.3–1.1, slack≈0.85 → net≈-0.55).
+        // New floor ensures gain > 0 for any sustained drift above ~0.5σ:
+        //   gain = clamp(|momentum|,0,1.5) − k_slack ≥ 0.5 − 0.50 = 0.0  (worst case)
+        //   gain at 1.0σ drift: 1.0 − 0.35 = 0.65  → C_ss = 0.65/gamma >> threshold
         const double mad_ratio = static_cast<double>(channel_state.roc_mad) / nf_safe;
-        const double target_slack = std::clamp(mad_ratio + 0.05, 0.75, 0.95);
+        const double target_slack = std::clamp(mad_ratio + 0.05, 0.20, 0.50);
         
         // Prevent slack from jumping more than 0.001 per frame to maintain CUSUM stability
         const double delta_slack = std::clamp(target_slack - channel_state.drift_smoothed_slack, -0.001, 0.001);
@@ -471,18 +477,35 @@ StageResult StageS5RateOfChange::process(
         const double decay_factor = (1.0 - gamma);
 
         // [Refinement 4]: Final Gated Path Selection
+        // [SURGICAL FIX 1 & 4]: Evidence Preservation replaces Decay-on-Disagreement.
+        //
+        // ACCUMULATE path: confident, aligned signal → net positive input on active side.
+        //   Active side:  C = C * (1-γ) + cusum_input - k_slack   [grows toward C_ss]
+        //   Passive side: C = C * (1-γ)                            [pure leakage only]
+        //   Removing '-k_slack' from the passive side prevents the idle accumulator
+        //   from being punished while the active one is building up. This was previously
+        //   causing zero-crossing events to reset both sides simultaneously.
+        //
+        // HOLD path (was: Decay-Only with -k_slack): single noisy frame no longer erases
+        //   hard-won evidence. Only natural leakage (γ ≈ 3%/sample) applies, preserving
+        //   signal across typical jitter bursts of 5–15 frames:
+        //     5 held frames: C_remaining = C * 0.97^5 ≈ 0.859 × C  (14% loss vs. ~425% loss)
         if (has_energy && is_agreeing && is_confident) {
             if (momentum > 0.0) {
+                // [FIX 1+4] Active side accumulates; passive side leaks only (no slack penalty)
                 channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor + cusum_input - k_slack);
-                channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor - k_slack);
+                channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor);
             } else {
-                channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor - k_slack);
+                // [FIX 1+4] Active side accumulates; passive side leaks only (no slack penalty)
+                channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor);
                 channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor + cusum_input - k_slack);
             }
         } else {
-            // Explicit Decay-Only Path for conflicts, gaps, or insufficient confidence
-            channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor - k_slack);
-            channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor - k_slack);
+            // [FIX 1] HOLD MODE: insufficient confidence or energy — apply only natural
+            // leakage (1-γ), do NOT subtract k_slack. A single noisy frame must not
+            // destroy minutes of accumulated drift evidence.
+            channel_state.drift_cusum_pos = std::max(0.0, channel_state.drift_cusum_pos * decay_factor);
+            channel_state.drift_cusum_neg = std::max(0.0, channel_state.drift_cusum_neg * decay_factor);
         }
 
         // Limit values to prevent explosion

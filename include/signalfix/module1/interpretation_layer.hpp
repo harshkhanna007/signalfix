@@ -26,7 +26,13 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <cstring>
 #include "types.hpp"
+// Forward-declare the decision type so interpretation_layer.hpp
+// can use it without creating a circular include.
+// The full definition is in stages/drift_stabilizer.hpp.
+// SSOT Rule: Interpretation reads ONLY DecisionResult for drift state.
+namespace signalfix { struct StabilizerResult; }
 
 namespace signalfix {
 
@@ -147,11 +153,14 @@ struct TextRecord
     const char* diagnostic;
 };
 
+// compute_severity: For DRIFT, severity is passed in via the decision_severity
+// parameter (already bounded by DriftStabilizer). raw gsigma is FORBIDDEN here.
+// For all other failure modes, the existing duration/confidence logic applies.
 [[nodiscard]] inline SeverityLevel
 compute_severity(const FailureMode  mode,
                  const uint32_t     duration,
                  const float        confidence,
-                 const float        gsigma = 0.0f) noexcept
+                 const float        decision_severity = 0.0f) noexcept
 {
     switch (mode)
     {
@@ -169,12 +178,13 @@ compute_severity(const FailureMode  mode,
             return                         SeverityLevel::LOW;
 
         case FailureMode::DRIFT:
-            // Severity depends ONLY on gSigma — no duration fallbacks.
-            // Thresholds aligned with S5's DRIFT_ON (12.0) and DRIFT_OFF (4.0).
-            if (gsigma >= 20.0f) return SeverityLevel::CRITICAL;
-            if (gsigma >= 12.0f) return SeverityLevel::HIGH;
-            if (gsigma >=  4.0f) return SeverityLevel::MEDIUM;
-            return                      SeverityLevel::LOW;
+            // SSOT RULE: Severity for DRIFT is computed from the Decision Layer's
+            // bounded severity score, NOT from raw env.drift_gsigma.
+            // This guarantees only confirmed, stabilizer-gated drift can escalate.
+            if (decision_severity >= 18.0f) return SeverityLevel::CRITICAL;
+            if (decision_severity >= 10.0f) return SeverityLevel::HIGH;
+            if (decision_severity >=  5.0f) return SeverityLevel::MEDIUM;
+            return                                 SeverityLevel::LOW;
 
         case FailureMode::STALE:
             if (duration > 15u) return SeverityLevel::CRITICAL;
@@ -298,32 +308,30 @@ lookup_text(const FailureMode  mode,
 // interpret() — Primary API.
 // =============================================================================
 
+// =============================================================================
+// interpret() — Hardware/Timing Faults only (SPIKE, STALE, GAP, INVALID)
+// =============================================================================
+// SSOT RULE: This overload is FORBIDDEN from classifying drift.
+// It reads env for hardware failure modes only. Drift classification is handled
+// exclusively by the decision-aware overload below.
 [[nodiscard]] inline InterpretationReport
 interpret(const MeasurementEnvelope& env,
           const InterpretationConfig& cfg = InterpretationConfig{}) noexcept
 {
     InterpretationReport r{};
 
-    // ── Edge Case Guard: Duration Overflow (SFX-M1-TDS-023) ────────────────────
+    // ── Duration Overflow Guard ──────────────────────────────────────────────
     const uint32_t kMaxSafeDuration = 999999u;
     uint32_t safe_duration = env.failure_duration;
-    if (safe_duration > kMaxSafeDuration)
-    {
-        safe_duration = kMaxSafeDuration;
-    }
+    if (safe_duration > kMaxSafeDuration) { safe_duration = kMaxSafeDuration; }
 
-    // ── Step 1: Copy raw fields with hardening ──────────────────────────────
-    // STATE CONSISTENCY: failure_type is derived from the status bitmask ONLY.
-    // We never infer drift from failure_hint alone — the bitmask is the
-    // single source of truth.
-    const bool system_in_drift = has_flag(env.status, SampleStatus::DRIFT_EXCEEDED);
-
-    // Synchronize failure_type with envelope bitmask.
-    if (system_in_drift) {
-        r.failure_type = FailureMode::DRIFT;
-    } else if (env.failure_hint == FailureMode::DRIFT) {
-        // Status says no drift, but hint says drift — bitmask wins.
-        r.failure_type = FailureMode::NONE;
+    // ── Step 1: Failure Type — Hardware faults ONLY ──────────────────────────
+    // SSOT: We NEVER read env.status DRIFT_EXCEEDED or env.drift_gsigma here.
+    // Drift can only be injected by the decision-aware overload.
+    // If the envelope's hint says DRIFT (from a previous pipeline pass or legacy
+    // code), we silently suppress it. Hardware-only modes are passed through.
+    if (env.failure_hint == FailureMode::DRIFT) {
+        r.failure_type = FailureMode::NONE; // Suppressed — not our authority.
     } else {
         r.failure_type = env.failure_hint;
     }
@@ -343,9 +351,7 @@ interpret(const MeasurementEnvelope& env,
         r.input_valid      = false;
         r.raw_confidence   = 0.0f;
         r.confidence_level = ConfidenceLevel::LOW;
-        if (conf_is_inf || out_of_range) {
-            r.failure_type = FailureMode::INVALID;
-        }
+        if (conf_is_inf || out_of_range) { r.failure_type = FailureMode::INVALID; }
     }
     else
     {
@@ -365,20 +371,19 @@ interpret(const MeasurementEnvelope& env,
     if (r.failure_type == FailureMode::INVALID)
     {
         r.severity = SeverityLevel::CRITICAL;
-        if (r.raw_confidence < 0.99f && !conf_is_nan) {
-            r.state_coherent = false;
-        }
+        if (r.raw_confidence < 0.99f && !conf_is_nan) { r.state_coherent = false; }
     }
 
-    // ── Step 4: Severity (gSigma-based for DRIFT; existing logic for others) ──
+    // ── Step 4: Severity (hardware fault modes only; DRIFT must not appear here)
     if (r.failure_type == FailureMode::INVALID)
     {
         r.severity = SeverityLevel::CRITICAL;
     }
     else
     {
+        // decision_severity=0.0f: safe — DRIFT case is unreachable here.
         r.severity = interp_detail::compute_severity(
-            r.failure_type, r.duration_samples, r.raw_confidence, env.drift_gsigma);
+            r.failure_type, r.duration_samples, r.raw_confidence, 0.0f);
     }
 
     r.stability = interp_detail::compute_stability(
@@ -398,6 +403,65 @@ interpret(const MeasurementEnvelope& env,
         r.summary    = text.summary;
         r.diagnostic = text.diagnostic;
     }
+
+    return r;
+}
+
+// =============================================================================
+// interpret() — Decision-Aware Overload (SSOT path for drift)
+// =============================================================================
+// This is the AUTHORITATIVE overload used in the main pipeline loop.
+// It receives the DecisionResult from the DriftStabilizer and uses it
+// as the SOLE source of drift classification.
+// Hardware faults from env are still interpreted separately and merged.
+//
+// Usage:
+//   auto interp = interpret(env, cfg, stabilizer_result);
+//
+// NOTE: The StabilizerResult forward declaration at the top of this header
+// is sufficient. The full type is resolved at the call site in the .cpp.
+// We must template on the Decision type to avoid a circular include.
+template <typename TDecision>
+[[nodiscard]] inline InterpretationReport
+interpret(const MeasurementEnvelope& env,
+          const InterpretationConfig& cfg,
+          const TDecision& decision) noexcept
+{
+    // ── Step 1: Interpret hardware faults from env (non-drift only) ───────────
+    InterpretationReport r = interpret(env, cfg);
+
+    // ── Step 2: SSOT Drift Injection ─────────────────────────────────────────
+    // If the Decision Authority confirms drift, we upgrade the report.
+    // If not, we guarantee drift is suppressed regardless of what env says.
+    // The decision.output field is the ONLY permitted source of drift truth.
+    const bool authority_says_drift =
+        (decision.output == decltype(decision.output)(1)); // 1 == DRIFT_CONFIRMED
+
+    if (authority_says_drift)
+    {
+        // Override: the authority has spoken. This is now a drift report.
+        r.failure_type    = FailureMode::DRIFT;
+        r.raw_confidence  = decision.severity / 100.0f; // Normalise severity to [0,1] range
+        if (r.raw_confidence > 1.0f) r.raw_confidence = 1.0f;
+        r.confidence_level = interp_detail::map_confidence(r.raw_confidence);
+        r.duration_samples = static_cast<uint32_t>(decision.persist_timer);
+        r.input_valid      = true;
+        r.state_coherent   = true;
+
+        // Severity is driven by the stabilizer's bounded severity score.
+        r.severity = interp_detail::compute_severity(
+            FailureMode::DRIFT, 0u, 0.0f, decision.severity);
+        r.stability = interp_detail::compute_stability(
+            FailureMode::DRIFT, r.duration_samples, cfg.persistent_threshold_samples);
+
+        const interp_detail::TextRecord text =
+            interp_detail::lookup_text(FailureMode::DRIFT, r.severity);
+        r.title      = text.title;
+        r.summary    = text.summary;
+        r.diagnostic = text.diagnostic;
+    }
+    // If !authority_says_drift: r already has the hardware-only result from above.
+    // Any residual DRIFT in failure_hint was already silently suppressed in interpret(env).
 
     return r;
 }
@@ -785,15 +849,17 @@ generate_drift_recommendation(SeverityLevel s,
 // Only prints when system_in_drift is true (DRIFT_EXCEEDED bitmask set).
 // =============================================================================
 
+// print_final_drift_report — Fires only on DRIFT_STARTED events.
+// SSOT: The guard is now performed at the call site by checking
+// decision.event == DRIFT_STARTED. This function no longer re-reads
+// env.status to determine whether drift is active.
 inline void
-print_final_drift_report(const MeasurementEnvelope&  env,
-                         const InterpretationReport& r,
+print_final_drift_report(const InterpretationReport& r,
                          const char*                 sensor_name,
                          const float                 drift_confidence,
                          const char*                 trend_label) noexcept
 {
-    const bool system_in_drift = has_flag(env.status, SampleStatus::DRIFT_EXCEEDED);
-    if (!system_in_drift) return;
+    // Guard: caller must ensure this is only called during a DRIFT_STARTED event.
 
     const char* severity_str = drift_severity_label(r.severity);
     const char* recommendation = generate_drift_recommendation(

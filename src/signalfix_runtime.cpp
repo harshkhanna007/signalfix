@@ -10,6 +10,7 @@
 #include "signalfix/module1/stages/stage_s5_5.hpp"
 #include "signalfix/module1/stages/stage_s5_rate_of_change.hpp"
 #include "signalfix/module1/types.hpp"
+#include "stages/drift_stabilizer.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -255,6 +256,8 @@ void run_stream_core(const char *name, const RawSample *samples, int n,
   StageS5RateOfChange s5_stage(s5_config);
   StageS55DriftPersistence s55_stage;
 
+  signalfix::DriftStabilizer stabilizer;
+
   StageS7Output s7_stage(noop_processed_output, nullptr);
 
   // Interpretation Layer config — shared default (10-sample PERSISTENT
@@ -306,31 +309,75 @@ void run_stream_core(const char *name, const RawSample *samples, int n,
     (void)s55_stage.process(env, ch);
     stage_s6_packager(env, ch);
 
+    // ── S7: Failure Tracker (hardware/timing faults — reads pristine env) ──────
+    // S7 sees the raw, unmodified envelope. It tracks SPIKE / STALE / GAP events.
+    // The Decision Layer runs AFTER S7 — S7 must never observe drift injections.
     (void)s7_stage.process(env, ch);
 
-    // ── Interpretation Layer ─────────────────────────────────────────────
-    // Stateless. O(1). Pure function of the envelope S7 just populated.
-    // Augments the raw telemetry below — does not replace it.
-    const signalfix::InterpretationReport interp =
-        signalfix::interpret(env, interp_cfg);
+    // ── Decision Authority (SSOT) ────────────────────────────────────────────
+    // The ONLY function permitted to classify drift. Its output is the sole
+    // permitted truth source for all downstream interpretation and output.
+    // env.status and env.failure_hint are NOT modified. The envelope remains a
+    // pure physical evidence carrier. drift state lives ONLY in this result.
+    const signalfix::StabilizerResult decision = stabilizer.update(
+        static_cast<float>(env.drift_gsigma),
+        ch.drift_confidence,
+        static_cast<float>(ch.drift_momentum));
 
-    // ── Trend Indicator ─────────────────────────────────────────────────
-    // State-aware smoothing and inertia. Managed strictly in presentation.
-    const bool system_in_drift = signalfix::has_flag(
-        env.status, signalfix::SampleStatus::DRIFT_EXCEEDED);
+    const bool system_in_drift =
+        (decision.output == signalfix::DriftOutput::DRIFT_CONFIRMED);
+
+    // ── Trend Indicator (presentation only, not a decision signal) ─────────
     signalfix::update_trend_state(trend_state, env.drift_gsigma);
     const char *trend_label = signalfix::compute_trend_label(
         trend_state, system_in_drift, env.drift_gsigma);
 
-    log_sample_full(i, env, ch,
-                    {signalfix::derive_classification(env), (float)rr});
+    // ── Interpretation Layer (reads decision authority, not raw env) ─────────
+    // Uses the decision-aware overload of interpret(). Hardware faults from
+    // env are still merged; drift classification comes exclusively from `decision`.
+    const signalfix::InterpretationReport interp =
+        signalfix::interpret(env, interp_cfg, decision);
+
+    // ── Sample diagnostics (always, compact) ───────────────────────────────
+    // derive_classification reads env.status for hardware faults.
+    // For drift classification we use decision.output directly.
+    const signalfix::Classification class_for_log =
+        system_in_drift ? signalfix::Classification::DRIFT
+                        : signalfix::derive_classification(env);
+
+    log_sample_full(i, env, ch, {class_for_log, (float)rr});
     log_interpretation_smart(i, interp, print_state);
 
-    // Final diagnostic block — fires on every sample where drift is active.
-    // Printed after smart log to avoid interleaving.
-    if (system_in_drift) {
-      print_final_drift_report(env, interp, get_sensor_name(ch.channel_id),
-                               ch.drift_confidence, trend_label);
+    // ── Alert layer: edge events ONLY (never per-frame state) ───────────────
+    // DriftEvent::NONE is emitted on every steady-state frame;
+    // this body is almost always skipped, eliminating alert spam entirely.
+    if (decision.event != signalfix::DriftEvent::NONE) {
+        const char *sensor = get_sensor_name(ch.channel_id);
+        std::puts("  \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510");
+        std::printf("  \u2502 %-54s \u2502\n",
+            signalfix::drift_event_to_string(decision.event));
+        std::printf(
+            "  \u2502  Sensor   : %-42s \u2502\n", sensor);
+        std::printf(
+            "  \u2502  Severity : %-6.2f   gSigma: %-6.2f   Conf: %-5.2f      \u2502\n",
+            (double)decision.severity,
+            (double)env.drift_gsigma,
+            (double)ch.drift_confidence);
+        std::printf(
+            "  \u2502  Momentum : %-+7.3f  Persist: %-4d  Recover: %-4d      \u2502\n",
+            (double)ch.drift_momentum,
+            decision.persist_timer,
+            decision.recover_timer);
+        std::printf(
+            "  \u2502  Sample   : %-4d    Trend: %-30s \u2502\n",
+            i, trend_label);
+        std::puts("  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518");
+
+        // Full diagnostic report only on DRIFT_STARTED.
+        if (decision.event == signalfix::DriftEvent::DRIFT_STARTED) {
+            print_final_drift_report(interp, sensor,
+                                     ch.drift_confidence, trend_label);
+        }
     }
   }
 }

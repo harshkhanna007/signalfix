@@ -44,6 +44,35 @@ struct RocDetectionConfig
     uint32_t baseline_reset_threshold{10u};
     uint64_t max_roc_delta_t_us{500'000u}; 
 
+    // --- ROC WINDOW FREQUENCY CUTOFF HELPER ---
+    // Select the ROC smoothing window N based on physical frequency response:
+    //
+    //   N = Fs / F_noise_cutoff
+    //
+    // where:
+    //   Fs              = sampling rate [Hz]
+    //   F_noise_cutoff  = highest frequency you want to reject [Hz]
+    //                     (e.g. 50 Hz for structural vibration at 1 kHz Fs)
+    //
+    // A small N (e.g. 1) captures every noise spike; a large N introduces
+    // phase delay but smooths out high-frequency interference.
+    // The result is clamped to [1, kRocWindowMaxN].
+    //
+    // Example: Fs=1000 Hz, F_noise_cutoff=50 Hz → N = 20 samples.
+    static constexpr uint16_t kRocWindowMaxN = 128u;  ///< Hard ceiling.
+
+    [[nodiscard]] static constexpr uint16_t
+    compute_roc_window_n(float sampling_rate_hz,
+                         float noise_cutoff_hz) noexcept {
+        if (sampling_rate_hz <= 0.0f || noise_cutoff_hz <= 0.0f) return 1u;
+        const float n_f = sampling_rate_hz / noise_cutoff_hz;
+        const uint16_t n = static_cast<uint16_t>(n_f < 1.0f  ? 1u :
+                           (n_f > static_cast<float>(kRocWindowMaxN))
+                               ? kRocWindowMaxN
+                               : static_cast<uint16_t>(n_f));
+        return n;
+    }
+
     void validate_or_die() const noexcept {
         bool ok = (k_sigma_high > k_sigma_low) &&
                   (sigma_min > 0.0f) &&
